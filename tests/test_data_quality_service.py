@@ -18,21 +18,28 @@ from src.services.append_service import (
     set_appended_dataset_as_current,
 )
 from src.services.data_quality_service import (
+    apply_cleaning_plan_preview,
+    apply_duplicate_group_preview,
+    apply_duplicate_handling_plan_preview,
     apply_missing_value_plan_preview,
     apply_quality_operations,
     create_cleaned_dataset,
     detect_identifier_columns,
     detect_invalid_columns,
+    duplicate_handling_plan_to_operations,
+    format_duplicate_handling_plan,
     format_missing_value_plan,
     generate_data_repair_suggestions_for_quality,
     get_iqr_numeric_measure_columns,
     summarize_missing_value_plan_effect,
     set_cleaned_dataset_as_current,
     summarize_duplicates_for_quality,
+    summarize_duplicate_handling_effect,
     summarize_identifier_columns,
     summarize_iqr_outliers_for_quality,
     summarize_missing_values_for_quality,
     summarize_quality_overview,
+    upsert_duplicate_handling_plan,
     upsert_missing_value_plan_item,
 )
 from src.services.data_source_service import save_project_data_files, set_current_analysis_file
@@ -178,6 +185,120 @@ class DataQualityServiceTests(unittest.TestCase):
 
         self.assertEqual(duplicate_summary["duplicate_count"], 1)
         self.assertEqual(len(cleaned), 3)
+
+    def test_duplicate_plan_drop_all_duplicates_uses_copy(self):
+        df = pd.DataFrame(
+            {
+                "order_id": [1, 1, 2, 3],
+                "amount": [10, 10, 20, 30],
+            },
+            index=[100, 101, 102, 103],
+        )
+        original = df.copy(deep=True)
+        plan = {"method": "drop_all_duplicates"}
+
+        preview = apply_duplicate_handling_plan_preview(df, plan)
+        effect = summarize_duplicate_handling_effect(df, plan)
+        table = format_duplicate_handling_plan(plan, df)
+
+        pd.testing.assert_frame_equal(df, original)
+        self.assertEqual(len(preview), 3)
+        self.assertIn(100, preview.index)
+        self.assertNotIn(101, preview.index)
+        self.assertEqual(effect["removed_rows"], 1)
+        self.assertEqual(effect["duplicate_group_rows"], 2)
+        self.assertEqual(effect["after_duplicate_group_rows"], 0)
+        self.assertFalse(table.empty)
+
+    def test_duplicate_plan_drop_all_keeps_one_row_per_duplicate_group(self):
+        df = pd.DataFrame(
+            {
+                "order_id": [1, 1, 2, 2, 2, 3],
+                "amount": [10, 10, 20, 20, 20, 30],
+            },
+            index=[10, 11, 20, 21, 22, 30],
+        )
+        plan = {"method": "drop_all_duplicates"}
+
+        preview = apply_duplicate_handling_plan_preview(df, plan)
+        group_preview = apply_duplicate_group_preview(df, plan)
+        effect = summarize_duplicate_handling_effect(df, plan)
+
+        self.assertEqual(len(preview), 3)
+        self.assertEqual(preview.index.tolist(), [10, 20, 30])
+        self.assertEqual(group_preview.index.tolist(), [10, 20])
+        self.assertEqual(effect["duplicate_group_rows"], 5)
+        self.assertEqual(effect["removed_rows"], 3)
+        self.assertEqual(effect["after_duplicate_group_rows"], 0)
+
+    def test_duplicate_plan_drop_selected_rows_by_stable_index(self):
+        df = pd.DataFrame(
+            {
+                "order_id": [1, 1, 2, 3],
+                "amount": [10, 10, 20, 30],
+            },
+            index=[100, 101, 102, 103],
+        )
+        plan = {"method": "drop_selected_rows", "row_indices": [101]}
+
+        preview = apply_duplicate_handling_plan_preview(df, plan)
+        group_preview = apply_duplicate_group_preview(df, plan)
+        operations = duplicate_handling_plan_to_operations(plan)
+
+        self.assertNotIn(101, preview.index)
+        self.assertIn(100, preview.index)
+        self.assertEqual(len(preview), 3)
+        self.assertEqual(group_preview.index.tolist(), [100])
+        self.assertEqual(operations[0]["type"], "drop_rows_by_index")
+        self.assertEqual(operations[0]["row_indices"], [101])
+
+    def test_duplicate_metrics_distinguish_group_rows_removed_and_remaining(self):
+        df = pd.DataFrame(
+            {
+                "order_id": [1, 1, 2, 2, 2, 3],
+                "amount": [10, 10, 20, 20, 20, 30],
+            }
+        )
+
+        summary = summarize_duplicates_for_quality(df)
+        effect = summarize_duplicate_handling_effect(
+            df,
+            {"method": "drop_selected_rows", "row_indices": [1]},
+        )
+
+        self.assertEqual(summary["duplicate_group_rows"], 5)
+        self.assertEqual(summary["duplicate_count"], 3)
+        self.assertEqual(effect["duplicate_group_rows"], 5)
+        self.assertEqual(effect["removed_rows"], 1)
+        self.assertEqual(effect["after_duplicate_group_rows"], 3)
+
+    def test_cleaning_plan_preview_applies_missing_then_duplicate_plan(self):
+        df = pd.DataFrame(
+            {
+                "order_id": [1, 1, 2],
+                "amount": [None, None, 20],
+            },
+            index=[10, 11, 12],
+        )
+        missing_plan = [{"column": "amount", "method": "zero"}]
+        duplicate_plan = {"method": "drop_all_duplicates"}
+
+        preview, steps = apply_cleaning_plan_preview(df, missing_plan, duplicate_plan)
+
+        self.assertEqual(len(preview), 2)
+        self.assertEqual(int(preview["amount"].isna().sum()), 0)
+        self.assertEqual([step["type"] for step in steps], ["fill_missing", "drop_duplicates"])
+
+    def test_duplicate_plan_replaces_conflicting_plan(self):
+        plan = upsert_duplicate_handling_plan(None, {"method": "drop_all_duplicates"})
+        plan = upsert_duplicate_handling_plan(
+            plan,
+            {"method": "drop_selected_rows", "row_indices": [2, 2, 3]},
+        )
+
+        self.assertEqual(plan["method"], "drop_selected_rows")
+        self.assertEqual(plan["row_indices"], [2, 3])
+        self.assertNotIn("drop_all_duplicates", plan)
 
     def test_iqr_outlier_detection_and_drop(self):
         self._set_csv_as_current(

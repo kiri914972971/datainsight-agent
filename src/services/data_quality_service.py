@@ -262,10 +262,12 @@ def missing_sample_preview(df: pd.DataFrame, limit: int = 20) -> pd.DataFrame:
 
 def summarize_duplicates_for_quality(df: pd.DataFrame) -> dict[str, Any]:
     duplicate_mask = df.duplicated(keep=False)
-    duplicate_count = int(df.duplicated().sum())
+    duplicate_group_rows = int(duplicate_mask.sum())
+    duplicate_count = int(df.duplicated(keep="first").sum())
     return {
         "duplicate_count": duplicate_count,
-        "duplicate_ratio": round(duplicate_count / max(len(df), 1) * 100, 2),
+        "duplicate_group_rows": duplicate_group_rows,
+        "duplicate_ratio": round(duplicate_group_rows / max(len(df), 1) * 100, 2),
         "preview": df.loc[duplicate_mask].head(50).copy(),
     }
 
@@ -523,6 +525,111 @@ def format_missing_value_plan(
     return pd.DataFrame(rows)
 
 
+def upsert_duplicate_handling_plan(
+    current_plan: dict[str, Any] | None,
+    new_plan: dict[str, Any] | None,
+) -> dict[str, Any]:
+    method = (new_plan or {}).get("method", "none")
+    if method not in {"none", "drop_all_duplicates", "drop_selected_rows"}:
+        method = "none"
+    normalized: dict[str, Any] = {"method": method}
+    if method == "drop_selected_rows":
+        normalized["row_indices"] = list(dict.fromkeys((new_plan or {}).get("row_indices", [])))
+    return normalized
+
+
+def duplicate_handling_plan_to_operations(plan: dict[str, Any] | None) -> list[dict[str, Any]]:
+    method = (plan or {}).get("method")
+    if method == "drop_all_duplicates":
+        return [{"type": "drop_duplicates"}]
+    if method == "drop_selected_rows":
+        row_indices = list(dict.fromkeys((plan or {}).get("row_indices", [])))
+        if row_indices:
+            return [{"type": "drop_rows_by_index", "row_indices": row_indices}]
+    return []
+
+
+def apply_duplicate_handling_plan_preview(
+    df: pd.DataFrame,
+    plan: dict[str, Any] | None,
+) -> pd.DataFrame:
+    result, _ = apply_quality_operations(df.copy(), duplicate_handling_plan_to_operations(plan))
+    return result
+
+
+def apply_duplicate_group_preview(
+    df: pd.DataFrame,
+    plan: dict[str, Any] | None,
+) -> pd.DataFrame:
+    original_duplicate_indices = df.index[df.duplicated(keep=False)]
+    if len(original_duplicate_indices) == 0:
+        return df.head(0).copy()
+    preview = apply_duplicate_handling_plan_preview(df, plan)
+    return preview.loc[preview.index.intersection(original_duplicate_indices)].copy()
+
+
+def summarize_duplicate_handling_effect(
+    df: pd.DataFrame,
+    plan: dict[str, Any] | None,
+) -> dict[str, Any]:
+    before_summary = summarize_duplicates_for_quality(df)
+    preview = apply_duplicate_handling_plan_preview(df, plan)
+    after_summary = summarize_duplicates_for_quality(preview)
+    return {
+        "before_rows": int(len(df)),
+        "after_rows": int(len(preview)),
+        "removed_rows": int(len(df) - len(preview)),
+        "before_duplicate_count": int(before_summary["duplicate_count"]),
+        "after_duplicate_count": int(after_summary["duplicate_count"]),
+        "duplicate_group_rows": int(before_summary["duplicate_group_rows"]),
+        "after_duplicate_group_rows": int(after_summary["duplicate_group_rows"]),
+    }
+
+
+def format_duplicate_handling_plan(
+    plan: dict[str, Any] | None,
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+    method = (plan or {}).get("method", "none")
+    if method in {None, "none"}:
+        return pd.DataFrame()
+
+    effect = summarize_duplicate_handling_effect(df, plan)
+    if method == "drop_all_duplicates":
+        step = "删除完全重复行（每组保留第一条）"
+        impact = f"预计删除 {effect['removed_rows']:,} 行"
+    elif method == "drop_selected_rows":
+        selected_count = len((plan or {}).get("row_indices", []))
+        step = "删除选中重复行"
+        impact = f"已选择 {selected_count:,} 个原始行索引，预计删除 {effect['removed_rows']:,} 行"
+    else:
+        return pd.DataFrame()
+
+    return pd.DataFrame(
+        [
+            {
+                "处理步骤": step,
+                "预计影响": impact,
+                "状态": "待执行",
+            }
+        ]
+    )
+
+
+def apply_cleaning_plan_preview(
+    df: pd.DataFrame,
+    missing_value_plan: list[dict[str, Any]] | None = None,
+    duplicate_handling_plan: dict[str, Any] | None = None,
+    extra_operations: list[dict[str, Any]] | None = None,
+) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+    operations = [
+        *missing_value_plan_to_operations(missing_value_plan),
+        *duplicate_handling_plan_to_operations(duplicate_handling_plan),
+        *(extra_operations or []),
+    ]
+    return apply_quality_operations(df, operations)
+
+
 def apply_quality_operations(
     df: pd.DataFrame,
     operations: list[dict[str, Any]],
@@ -537,7 +644,7 @@ def apply_quality_operations(
             columns = operation.get("columns")
             column = operation.get("column")
             subset = columns or ([column] if column else None)
-            result = result.dropna(subset=subset).reset_index(drop=True)
+            result = result.dropna(subset=subset).copy()
         elif op_type == "drop_columns":
             columns = [
                 column
@@ -561,7 +668,10 @@ def apply_quality_operations(
             custom_value = operation.get("custom_value", "")
             result = _fill_missing(result, column, method, custom_value)
         elif op_type == "drop_duplicates":
-            result = result.drop_duplicates().reset_index(drop=True)
+            result = result.drop_duplicates(keep="first").copy()
+        elif op_type == "drop_rows_by_index":
+            row_indices = list(dict.fromkeys(operation.get("row_indices", [])))
+            result = result.loc[~result.index.isin(row_indices)].copy()
         elif op_type == "outlier":
             column = operation.get("column")
             method = operation.get("method")
@@ -615,7 +725,9 @@ def create_cleaned_dataset(
             if step.get("type") in {"drop_missing_rows", "drop_high_missing_columns", "drop_columns", "fill_missing"}
         ],
         "duplicate_actions": [
-            step for step in applied_steps if step.get("type") == "drop_duplicates"
+            step
+            for step in applied_steps
+            if step.get("type") in {"drop_duplicates", "drop_rows_by_index"}
         ],
         "outlier_actions": [
             step for step in applied_steps if step.get("type") == "outlier"

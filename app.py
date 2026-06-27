@@ -126,11 +126,15 @@ from src.services.current_dataset_service import (
     set_current_analysis_dataset,
 )
 from src.services.data_quality_service import (
+    apply_duplicate_handling_plan_preview,
+    apply_duplicate_group_preview,
     apply_missing_value_plan_preview,
     apply_quality_operations,
     create_cleaned_dataset,
     detect_identifier_columns as detect_quality_identifier_columns,
     detect_invalid_columns as detect_quality_invalid_columns,
+    duplicate_handling_plan_to_operations,
+    format_duplicate_handling_plan,
     format_missing_value_plan,
     generate_data_repair_suggestions_for_quality,
     get_iqr_numeric_measure_columns,
@@ -141,11 +145,13 @@ from src.services.data_quality_service import (
     remove_missing_value_plan_item,
     set_cleaned_dataset_as_current,
     summarize_duplicates_for_quality,
+    summarize_duplicate_handling_effect,
     summarize_identifier_columns,
     summarize_iqr_outliers_for_quality,
     summarize_missing_values_for_quality,
     summarize_missing_value_plan_effect,
     summarize_quality_overview,
+    upsert_duplicate_handling_plan,
     upsert_missing_value_plan_item,
 )
 from src.services.analysis_dataset_service import (
@@ -1739,7 +1745,7 @@ def render_project_data_quality_tab(project_id: str) -> None:
             }
             return f"{operation.get('column', '-')}：{method_labels.get(operation.get('method'), operation.get('method'))}"
         if op_type == "drop_duplicates":
-            return "删除完全重复行"
+            return "删除完全重复行（每组保留第一条）"
         if op_type == "outlier":
             method_labels = {
                 "drop_rows": "删除异常值行",
@@ -1782,7 +1788,17 @@ def render_project_data_quality_tab(project_id: str) -> None:
         st.session_state.missing_value_plan_project_id = project_id
         st.session_state.missing_value_plan = []
     missing_value_plan = st.session_state.setdefault("missing_value_plan", [])
-    operations: list[dict] = missing_value_plan_to_operations(missing_value_plan)
+    if st.session_state.get("duplicate_handling_plan_project_id") != project_id:
+        st.session_state.duplicate_handling_plan_project_id = project_id
+        st.session_state.duplicate_handling_plan = {"method": "none"}
+    duplicate_handling_plan = st.session_state.setdefault(
+        "duplicate_handling_plan",
+        {"method": "none"},
+    )
+    operations: list[dict] = [
+        *missing_value_plan_to_operations(missing_value_plan),
+        *duplicate_handling_plan_to_operations(duplicate_handling_plan),
+    ]
 
     overview_tab, missing_tab, duplicate_tab, id_tab, outlier_tab, repair_tab = st.tabs(
         ["总览", "缺失值", "重复值", "ID识别", "异常值", "数据修复"]
@@ -1958,23 +1974,141 @@ def render_project_data_quality_tab(project_id: str) -> None:
     with duplicate_tab:
         st.markdown("#### 重复值诊断")
         duplicate_cols = st.columns(2)
-        duplicate_cols[0].metric("重复行数量", f"{duplicate_summary['duplicate_count']:,}")
+        duplicate_cols[0].metric("重复组涉及行数", f"{duplicate_summary['duplicate_group_rows']:,}")
         duplicate_cols[1].metric("重复行占比", f"{duplicate_summary['duplicate_ratio']:.2f}%")
+        duplicate_preview = duplicate_summary["preview"].copy()
+        if not duplicate_preview.empty:
+            duplicate_preview.insert(0, "原始行索引", duplicate_preview.index)
         with st.expander("重复行预览", expanded=duplicate_summary["duplicate_count"] > 0):
-            if duplicate_summary["preview"].empty:
+            st.caption("以下展示所有处于重复组中的记录，系统会按照完整行内容判断重复。")
+            if duplicate_preview.empty:
                 st.success("当前未检测到完全重复行。")
             else:
-                st.dataframe(duplicate_summary["preview"], use_container_width=True)
+                st.dataframe(duplicate_preview, use_container_width=True, hide_index=True)
 
         st.markdown("#### 重复值处理")
         duplicate_method = st.selectbox(
             "重复值处理方式",
-            ["不处理", "删除完全重复行"],
-            key=f"project_quality_duplicate_method_v2_{project_id}",
+            ["不处理", "删除完全重复行（每组保留第一条）", "删除选中重复行"],
+            key=f"project_quality_duplicate_method_v3_{project_id}",
         )
-        if duplicate_method == "删除完全重复行":
-            operations.append({"type": "drop_duplicates"})
-        st.caption("处理前后预计变化会在「数据修复」中汇总展示。")
+        if duplicate_method == "不处理":
+            if st.button(
+                "清空重复值处理计划",
+                key=f"project_quality_duplicate_plan_none_{project_id}",
+            ):
+                st.session_state.duplicate_handling_plan = upsert_duplicate_handling_plan(
+                    st.session_state.get("duplicate_handling_plan"),
+                    {"method": "none"},
+                )
+                st.rerun()
+        elif duplicate_method == "删除完全重复行（每组保留第一条）":
+            st.caption("该方式会对每组完全相同的记录保留第一条，删除其余重复记录。")
+            if st.button(
+                "加入重复值处理计划",
+                type="primary",
+                key=f"project_quality_duplicate_plan_all_{project_id}",
+            ):
+                st.session_state.duplicate_handling_plan = upsert_duplicate_handling_plan(
+                    st.session_state.get("duplicate_handling_plan"),
+                    {"method": "drop_all_duplicates"},
+                )
+                st.rerun()
+        elif duplicate_method == "删除选中重复行":
+            st.caption("该方式仅删除你在重复行预览中选中的原始行索引。")
+            if duplicate_preview.empty:
+                st.info("当前没有可选择删除的重复行。")
+            else:
+                editable_duplicate_preview = duplicate_preview.copy()
+                editable_duplicate_preview.insert(0, "删除", False)
+                edited_duplicate_preview = st.data_editor(
+                    editable_duplicate_preview,
+                    use_container_width=True,
+                    hide_index=True,
+                    disabled=[
+                        column
+                        for column in editable_duplicate_preview.columns
+                        if column != "删除"
+                    ],
+                    key=f"project_quality_duplicate_selected_rows_{project_id}",
+                )
+                if st.button(
+                    "按选中行加入处理计划",
+                    type="primary",
+                    key=f"project_quality_duplicate_plan_selected_{project_id}",
+                ):
+                    if "原始行索引" not in edited_duplicate_preview.columns:
+                        st.warning("缺少稳定的原始行索引，无法按选中行删除。")
+                    else:
+                        selected_rows = edited_duplicate_preview[
+                            edited_duplicate_preview["删除"].astype(bool)
+                        ]
+                        selected_indices = selected_rows["原始行索引"].tolist()
+                        if not selected_indices:
+                            st.warning("请先勾选要删除的重复行。")
+                        else:
+                            st.session_state.duplicate_handling_plan = upsert_duplicate_handling_plan(
+                                st.session_state.get("duplicate_handling_plan"),
+                                {
+                                    "method": "drop_selected_rows",
+                                    "row_indices": selected_indices,
+                                },
+                            )
+                            st.rerun()
+
+        st.markdown("#### 当前重复值处理计划")
+        duplicate_plan_table = format_duplicate_handling_plan(
+            st.session_state.get("duplicate_handling_plan"),
+            quality_df,
+        )
+        if duplicate_plan_table.empty:
+            st.info("尚未添加重复值处理步骤。")
+        else:
+            st.dataframe(duplicate_plan_table, use_container_width=True, hide_index=True)
+            if st.button(
+                "移除重复值处理步骤",
+                key=f"project_quality_duplicate_plan_remove_{project_id}",
+            ):
+                st.session_state.duplicate_handling_plan = upsert_duplicate_handling_plan(
+                    st.session_state.get("duplicate_handling_plan"),
+                    {"method": "none"},
+                )
+                st.rerun()
+
+        st.markdown("#### 处理结果预览")
+        if not duplicate_handling_plan_to_operations(st.session_state.get("duplicate_handling_plan")):
+            st.info("尚未添加重复值处理步骤。")
+        else:
+            try:
+                duplicate_effect = summarize_duplicate_handling_effect(
+                    quality_df,
+                    st.session_state.get("duplicate_handling_plan"),
+                )
+                duplicate_effect_cards = st.columns(5)
+                duplicate_effect_cards[0].metric("处理前总行数", f"{duplicate_effect['before_rows']:,}")
+                duplicate_effect_cards[1].metric("预计处理后总行数", f"{duplicate_effect['after_rows']:,}")
+                duplicate_effect_cards[2].metric("重复组涉及行数", f"{duplicate_effect['duplicate_group_rows']:,}")
+                duplicate_effect_cards[3].metric("预计删除重复行数", f"{duplicate_effect['removed_rows']:,}")
+                duplicate_effect_cards[4].metric("处理后剩余重复行数", f"{duplicate_effect['after_duplicate_group_rows']:,}")
+                duplicate_group_preview_after = apply_duplicate_group_preview(
+                    quality_df,
+                    st.session_state.get("duplicate_handling_plan"),
+                )
+                duplicate_preview_after = apply_duplicate_handling_plan_preview(
+                    quality_df,
+                    st.session_state.get("duplicate_handling_plan"),
+                )
+                st.markdown("##### 重复组处理后预览")
+                st.caption("以下仅展示原重复组在应用当前重复值处理计划后的剩余记录。")
+                if duplicate_group_preview_after.empty:
+                    st.success("应用当前重复值处理计划后，原重复组中没有剩余记录。")
+                else:
+                    st.dataframe(duplicate_group_preview_after.head(20), use_container_width=True)
+                st.markdown("##### 全表处理后预览")
+                st.caption("以下展示全量数据应用当前重复值处理计划后的前 20 行，不会修改原始数据。")
+                st.dataframe(duplicate_preview_after.head(20), use_container_width=True)
+            except Exception as exc:
+                st.warning(f"暂时无法生成重复值处理后预览：{exc}")
 
     with id_tab:
         st.markdown("#### ID字段识别")
@@ -2122,25 +2256,15 @@ def render_project_data_quality_tab(project_id: str) -> None:
         else:
             st.dataframe(missing_plan_table, use_container_width=True, hide_index=True)
 
-        duplicate_steps = [operation for operation in operations if operation.get("type") == "drop_duplicates"]
+        duplicate_plan_table = format_duplicate_handling_plan(
+            st.session_state.get("duplicate_handling_plan"),
+            quality_df,
+        )
         st.markdown("##### 重复值处理步骤")
-        if duplicate_steps:
-            st.dataframe(
-                pd.DataFrame(
-                    [
-                        {
-                            "处理步骤": _operation_label(step),
-                            "预计影响": "删除完全重复行",
-                            "状态": "待执行",
-                        }
-                        for step in duplicate_steps
-                    ]
-                ),
-                use_container_width=True,
-                hide_index=True,
-            )
-        else:
+        if duplicate_plan_table.empty:
             st.info("暂无重复值处理步骤。")
+        else:
+            st.dataframe(duplicate_plan_table, use_container_width=True, hide_index=True)
 
         outlier_steps = [operation for operation in operations if operation.get("type") == "outlier"]
         st.markdown("##### 异常值处理步骤")
