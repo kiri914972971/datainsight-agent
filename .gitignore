@@ -2,11 +2,16 @@
 .venv/
 .venv312/
 venv/
+env/
 
 # Python caches and test artifacts
 __pycache__/
-*.py[cod]
+*.pyc
+*.pyo
+*.pyd
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
 htmlcov/
 
@@ -15,10 +20,37 @@ htmlcov/
 .env.*
 .streamlit/secrets.toml
 
-# Runtime output
+# Streamlit runtime logs
+streamlit*.log
+
+# Browser debug/runtime folders
+.chrome-debug-test/
+.chrome-relationship/
+.chrome*/
+.edge-debug/
+.edge-shot/
+.edge-metric-center-shot/
+.edge*/
+
+# Logs and temporary files
 *.log
+*.tmp
+*.bak
+temp/
+tmp/
+.Rhistory
+
+# Generated outputs
 outputs/*
 !outputs/.gitkeep
+outputs/*.log
+outputs/*.tmp
+outputs/temp/
+outputs/tmp/
+
+# Workspace runtime data
+workspace/projects/*
+!workspace/projects/.gitkeep
 
 # Editor and operating-system files
 .vscode/

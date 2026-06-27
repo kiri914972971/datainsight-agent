@@ -1,0 +1,347 @@
+import tempfile
+import unittest
+from io import BytesIO
+from pathlib import Path
+from unittest.mock import patch
+
+import pandas as pd
+
+from src import project_workspace
+from src.services.current_dataset_service import (
+    get_current_analysis_dataset,
+    list_project_datasets,
+    load_current_analysis_dataframe,
+)
+from src.services.append_service import (
+    build_appended_dataset,
+    list_append_sources,
+    set_appended_dataset_as_current,
+)
+from src.services.data_quality_service import (
+    apply_missing_value_plan_preview,
+    apply_quality_operations,
+    create_cleaned_dataset,
+    detect_identifier_columns,
+    detect_invalid_columns,
+    format_missing_value_plan,
+    generate_data_repair_suggestions_for_quality,
+    get_iqr_numeric_measure_columns,
+    summarize_missing_value_plan_effect,
+    set_cleaned_dataset_as_current,
+    summarize_duplicates_for_quality,
+    summarize_identifier_columns,
+    summarize_iqr_outliers_for_quality,
+    summarize_missing_values_for_quality,
+    summarize_quality_overview,
+    upsert_missing_value_plan_item,
+)
+from src.services.data_source_service import save_project_data_files, set_current_analysis_file
+
+
+class UploadedFileStub(BytesIO):
+    def __init__(self, name: str, content: bytes):
+        super().__init__(content)
+        self.name = name
+
+    def getvalue(self) -> bytes:
+        return super().getvalue()
+
+
+class DataQualityServiceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.project_root = Path(self.temp_dir.name) / "projects"
+        self.root_patch = patch.object(
+            project_workspace,
+            "PROJECT_ROOT",
+            self.project_root,
+        )
+        self.root_patch.start()
+        self.project = project_workspace.create_project("Quality")
+
+    def tearDown(self):
+        self.root_patch.stop()
+        self.temp_dir.cleanup()
+
+    def _set_csv_as_current(self, content: bytes = None):
+        content = content or (
+            b"id,amount,region,mostly_missing\n"
+            b"1,10,East,\n"
+            b"2,,East,\n"
+            b"2,,East,\n"
+            b"3,1000,West,\n"
+        )
+        saved = save_project_data_files(
+            self.project["project_id"],
+            [UploadedFileStub("quality.csv", content)],
+        )
+        set_current_analysis_file(self.project["project_id"], saved[0]["file_id"], "CSV")
+
+    def test_missing_value_detection(self):
+        self._set_csv_as_current()
+        df = load_current_analysis_dataframe(self.project["project_id"])
+
+        summary = summarize_missing_values_for_quality(df)
+        amount_row = summary.loc[summary["字段名"] == "amount"].iloc[0]
+        mostly_missing_row = summary.loc[summary["字段名"] == "mostly_missing"].iloc[0]
+
+        self.assertEqual(int(amount_row["缺失值数量"]), 2)
+        self.assertEqual(float(amount_row["缺失值比例"]), 50.0)
+        self.assertEqual(amount_row["推荐处理方式"], "谨慎填充，建议结合业务判断")
+        self.assertEqual(mostly_missing_row["推荐处理方式"], "删除字段或重新获取数据源")
+
+    def test_missing_value_fill(self):
+        self._set_csv_as_current()
+        df = load_current_analysis_dataframe(self.project["project_id"])
+
+        cleaned, steps = apply_quality_operations(
+            df,
+            [{"type": "fill_missing", "column": "amount", "method": "zero"}],
+        )
+
+        self.assertEqual(int(cleaned["amount"].isna().sum()), 0)
+        self.assertEqual(float(cleaned.loc[1, "amount"]), 0)
+        self.assertEqual(steps[0]["type"], "fill_missing")
+
+    def test_missing_value_plan_applies_multiple_steps_to_copy(self):
+        df = pd.DataFrame(
+            {
+                "amount": [10.0, None, 30.0],
+                "region": ["East", None, "West"],
+                "drop_me": [None, None, None],
+            }
+        )
+        original = df.copy(deep=True)
+        plan = [
+            {"column": "amount", "method": "mean"},
+            {"column": "region", "method": "custom", "fill_value": "Unknown"},
+            {"column": "drop_me", "method": "drop_column"},
+        ]
+
+        preview = apply_missing_value_plan_preview(df, plan)
+        effect = summarize_missing_value_plan_effect(df, plan)
+
+        pd.testing.assert_frame_equal(df, original)
+        self.assertNotIn("drop_me", preview.columns)
+        self.assertEqual(int(preview["amount"].isna().sum()), 0)
+        self.assertEqual(int(preview["region"].isna().sum()), 0)
+        self.assertEqual(effect["before_missing_values"], 5)
+        self.assertEqual(effect["after_missing_values"], 0)
+
+    def test_missing_value_plan_replaces_same_column(self):
+        plan = []
+        plan = upsert_missing_value_plan_item(
+            plan,
+            {"column": "amount", "method": "mean"},
+        )
+        plan = upsert_missing_value_plan_item(
+            plan,
+            {"column": "amount", "method": "median"},
+        )
+
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(plan[0]["column"], "amount")
+        self.assertEqual(plan[0]["method"], "median")
+
+    def test_missing_value_plan_format(self):
+        df = pd.DataFrame({"amount": [1, None], "region": [None, "East"]})
+        plan = [
+            {"column": "amount", "method": "median"},
+            {"column": "region", "method": "mode"},
+        ]
+
+        table = format_missing_value_plan(plan, df)
+
+        self.assertEqual(len(table), 2)
+        self.assertIn("字段", table.columns)
+        self.assertIn("处理方式", table.columns)
+        self.assertIn("预计影响", table.columns)
+
+    def test_drop_high_missing_columns(self):
+        self._set_csv_as_current()
+        df = load_current_analysis_dataframe(self.project["project_id"])
+
+        cleaned, steps = apply_quality_operations(
+            df,
+            [{"type": "drop_high_missing_columns", "threshold": 0.8}],
+        )
+
+        self.assertNotIn("mostly_missing", cleaned.columns)
+        self.assertIn("mostly_missing", steps[0]["dropped_columns"])
+
+    def test_duplicate_detection_and_drop(self):
+        self._set_csv_as_current()
+        df = load_current_analysis_dataframe(self.project["project_id"])
+
+        duplicate_summary = summarize_duplicates_for_quality(df)
+        cleaned, _ = apply_quality_operations(df, [{"type": "drop_duplicates"}])
+
+        self.assertEqual(duplicate_summary["duplicate_count"], 1)
+        self.assertEqual(len(cleaned), 3)
+
+    def test_iqr_outlier_detection_and_drop(self):
+        self._set_csv_as_current(
+            b"id,amount,region\n1,10,East\n2,11,East\n3,12,West\n4,1000,West\n"
+        )
+        df = load_current_analysis_dataframe(self.project["project_id"])
+
+        outliers = summarize_iqr_outliers_for_quality(df)
+        self.assertIn("Q1", outliers.columns)
+        self.assertIn("Q3", outliers.columns)
+        self.assertIn("IQR", outliers.columns)
+        amount_outliers = outliers.loc[outliers["字段名"] == "amount"].iloc[0]
+        cleaned, _ = apply_quality_operations(
+            df,
+            [{"type": "outlier", "column": "amount", "method": "drop_rows"}],
+        )
+
+        self.assertEqual(int(amount_outliers["异常值数量"]), 1)
+        self.assertEqual(len(cleaned), 3)
+        self.assertNotIn(1000, cleaned["amount"].tolist())
+
+    def test_iqr_numeric_measure_columns_exclude_identifier_like_fields(self):
+        df = pd.DataFrame(
+            {
+                "销售工号": [1000000001, 1000000002, 1000000003, 1000000004],
+                "订单号": [9001, 9002, 9003, 9004],
+                "用户ID": [1, 2, 3, 4],
+                "mobile": [13800000001, 13800000002, 13800000003, 13800000004],
+                "销售额": [10, 11, 12, 1000],
+                "数量": [1, 2, 3, 4],
+                "amount": [20, 21, 22, 2000],
+                "region": ["East", "East", "West", "West"],
+            }
+        )
+
+        measure_columns = get_iqr_numeric_measure_columns(df)
+        outliers = summarize_iqr_outliers_for_quality(df)
+
+        self.assertNotIn("销售工号", measure_columns)
+        self.assertNotIn("订单号", measure_columns)
+        self.assertNotIn("用户ID", measure_columns)
+        self.assertNotIn("mobile", measure_columns)
+        self.assertIn("销售额", measure_columns)
+        self.assertIn("数量", measure_columns)
+        self.assertIn("amount", measure_columns)
+        self.assertEqual(set(outliers["字段名"]), {"销售额", "数量", "amount"})
+
+    def test_identifier_detection_excludes_dates_and_true_measures(self):
+        df = pd.DataFrame(
+            {
+                "销售工号": [1001, 1002, 1003, 1004],
+                "customer_id": ["C1", "C2", "C3", "C4"],
+                "交易日期": ["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04"],
+                "销售额": [10, 20, 30, 40],
+                "amount": [100, 200, 300, 400],
+                "region": ["East", "West", "North", "South"],
+            }
+        )
+
+        identifiers = detect_identifier_columns(df)
+        identifier_summary = summarize_identifier_columns(df, identifiers)
+
+        self.assertIn("销售工号", identifiers)
+        self.assertIn("customer_id", identifiers)
+        self.assertIn("region", identifiers)
+        self.assertNotIn("交易日期", identifiers)
+        self.assertNotIn("销售额", identifiers)
+        self.assertNotIn("amount", identifiers)
+        self.assertIn("识别原因", identifier_summary.columns)
+
+    def test_quality_overview_and_repair_suggestions(self):
+        df = pd.DataFrame(
+            {
+                "订单号": [1, 2, 3, 3, 5],
+                "amount": [10, 11, 12, 12, 1000],
+                "region": ["East", "East", "West", "West", "North"],
+                "mostly_missing": [None, None, None, None, "x"],
+                "Unnamed: 0": [1, 2, 3, 3, 5],
+            }
+        )
+
+        identifiers = detect_identifier_columns(df)
+        invalid_columns = detect_invalid_columns(df)
+        outliers = summarize_iqr_outliers_for_quality(df, identifiers)
+        overview = summarize_quality_overview(df, identifiers, invalid_columns, outliers)
+        suggestions = generate_data_repair_suggestions_for_quality(
+            df,
+            identifiers,
+            invalid_columns,
+            outliers,
+        )
+
+        self.assertGreaterEqual(overview["missing_values"], 4)
+        self.assertGreaterEqual(overview["duplicate_rows"], 1)
+        self.assertGreaterEqual(overview["identifier_column_count"], 1)
+        self.assertGreaterEqual(overview["suspicious_column_count"], 1)
+        self.assertGreaterEqual(overview["outlier_count"], 1)
+        self.assertIn("缺失率过高", set(suggestions["问题类型"]))
+        self.assertIn("重复行", set(suggestions["问题类型"]))
+        self.assertIn("疑似 ID 字段", set(suggestions["问题类型"]))
+        self.assertIn("检测到异常值", set(suggestions["问题类型"]))
+        self.assertIn("疑似无效字段", set(suggestions["问题类型"]))
+
+    def test_quality_detection_reads_appended_current_dataset(self):
+        saved = save_project_data_files(
+            self.project["project_id"],
+            [
+                UploadedFileStub(
+                    "north.csv",
+                    b"order_id,amount,region\n1,10,North\n2,11,North\n",
+                ),
+                UploadedFileStub(
+                    "south.csv",
+                    b"order_id,amount,region\n3,12,South\n4,1000,South\n",
+                ),
+            ],
+        )
+        sources = list_append_sources(self.project["project_id"])
+        source_ids = [source["source_id"] for source in sources]
+        build_appended_dataset(self.project["project_id"], source_ids)
+        set_appended_dataset_as_current(self.project["project_id"])
+
+        current = get_current_analysis_dataset(self.project["project_id"])
+        df = load_current_analysis_dataframe(self.project["project_id"])
+        identifiers = detect_identifier_columns(df)
+        outliers = summarize_iqr_outliers_for_quality(df, identifiers)
+
+        self.assertEqual(current["dataset_type"], "appended")
+        self.assertEqual(len(df), 4)
+        self.assertIn("order_id", identifiers)
+        self.assertTrue(any(outliers["字段名"] == "amount"))
+
+    def test_cleaned_dataset_registration_and_set_current(self):
+        self._set_csv_as_current()
+
+        metadata = create_cleaned_dataset(
+            self.project["project_id"],
+            [
+                {"type": "fill_missing", "column": "amount", "method": "zero"},
+                {"type": "drop_duplicates"},
+            ],
+        )
+        datasets = list_project_datasets(self.project["project_id"])
+        set_cleaned_dataset_as_current(self.project["project_id"])
+        current = get_current_analysis_dataset(self.project["project_id"])
+        current_df = load_current_analysis_dataframe(self.project["project_id"])
+
+        self.assertEqual(metadata["dataset_name"], "cleaned_dataset.csv")
+        self.assertEqual(metadata["source_dataset_name"], "quality.csv")
+        self.assertEqual(len(metadata["missing_value_actions"]), 1)
+        self.assertEqual(len(metadata["duplicate_actions"]), 1)
+        self.assertEqual(metadata["outlier_actions"], [])
+        self.assertTrue(
+            (
+                project_workspace.get_project_path(self.project["project_id"])
+                / "analysis"
+                / "cleaned_dataset.csv"
+            ).is_file()
+        )
+        self.assertIn("cleaned_dataset", {item["dataset_id"] for item in datasets})
+        self.assertEqual(current["dataset_type"], "cleaned")
+        self.assertEqual(current["dataset_name"], "cleaned_dataset.csv")
+        self.assertEqual(len(current_df), 3)
+
+
+if __name__ == "__main__":
+    unittest.main()
