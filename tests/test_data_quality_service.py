@@ -30,7 +30,9 @@ from src.services.data_quality_service import (
     format_duplicate_handling_plan,
     format_missing_value_plan,
     generate_data_repair_suggestions_for_quality,
+    get_final_id_columns,
     get_iqr_numeric_measure_columns,
+    reset_id_override_state,
     summarize_missing_value_plan_effect,
     set_cleaned_dataset_as_current,
     summarize_duplicates_for_quality,
@@ -39,6 +41,7 @@ from src.services.data_quality_service import (
     summarize_iqr_outliers_for_quality,
     summarize_missing_values_for_quality,
     summarize_quality_overview,
+    update_id_override_state,
     upsert_duplicate_handling_plan,
     upsert_missing_value_plan_item,
 )
@@ -368,6 +371,137 @@ class DataQualityServiceTests(unittest.TestCase):
         self.assertNotIn("销售额", identifiers)
         self.assertNotIn("amount", identifiers)
         self.assertIn("识别原因", identifier_summary.columns)
+
+    def test_final_id_columns_include_manual_ids(self):
+        df = pd.DataFrame(
+            {
+                "销售工号": [1001, 1002, 1003],
+                "订单号": [2001, 2002, 2003],
+                "amount": [10, 20, 30],
+            }
+        )
+
+        final_ids = get_final_id_columns(
+            df,
+            auto_id_columns=["销售工号"],
+            manual_id_columns=["订单号"],
+            manual_non_id_columns=[],
+        )
+
+        self.assertEqual(final_ids, ["销售工号", "订单号"])
+
+    def test_final_id_columns_respect_manual_cancel(self):
+        df = pd.DataFrame({"销售工号": [1001, 1002], "amount": [10, 20]})
+
+        final_ids = get_final_id_columns(
+            df,
+            auto_id_columns=["销售工号"],
+            manual_id_columns=[],
+            manual_non_id_columns=["销售工号"],
+        )
+
+        self.assertNotIn("销售工号", final_ids)
+
+    def test_manual_cancel_wins_if_override_state_conflicts(self):
+        df = pd.DataFrame({"销售工号": [1001, 1002], "amount": [10, 20]})
+
+        final_ids = get_final_id_columns(
+            df,
+            auto_id_columns=["销售工号"],
+            manual_id_columns=["销售工号"],
+            manual_non_id_columns=["销售工号"],
+        )
+
+        self.assertNotIn("销售工号", final_ids)
+
+    def test_id_override_conflict_resolution(self):
+        df = pd.DataFrame({"销售工号": [1001, 1002], "amount": [10, 20]})
+
+        manual_ids, manual_non_ids = update_id_override_state(
+            df,
+            manual_id_columns=[],
+            manual_non_id_columns=["销售工号"],
+            column="销售工号",
+            action="mark_id",
+        )
+        self.assertIn("销售工号", manual_ids)
+        self.assertNotIn("销售工号", manual_non_ids)
+
+        manual_ids, manual_non_ids = update_id_override_state(
+            df,
+            manual_id_columns=manual_ids,
+            manual_non_id_columns=manual_non_ids,
+            column="销售工号",
+            action="mark_non_id",
+        )
+        self.assertNotIn("销售工号", manual_ids)
+        self.assertIn("销售工号", manual_non_ids)
+
+    def test_reset_id_override_state_clears_manual_lists(self):
+        manual_ids, manual_non_ids = reset_id_override_state()
+
+        self.assertEqual(manual_ids, [])
+        self.assertEqual(manual_non_ids, [])
+
+    def test_business_measures_and_dates_not_auto_id_by_uniqueness(self):
+        df = pd.DataFrame(
+            {
+                "成交金额": [101.0, 202.0, 303.0, 404.0],
+                "客单价": [11.0, 22.0, 33.0, 44.0],
+                "amount": [100.0, 200.0, 300.0, 400.0],
+                "price": [1.0, 2.0, 3.0, 4.0],
+                "成交日期": ["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04"],
+                "employee_id": [1, 2, 3, 4],
+            }
+        )
+
+        identifiers = detect_identifier_columns(df)
+
+        self.assertIn("employee_id", identifiers)
+        self.assertNotIn("成交金额", identifiers)
+        self.assertNotIn("客单价", identifiers)
+        self.assertNotIn("amount", identifiers)
+        self.assertNotIn("price", identifiers)
+        self.assertNotIn("成交日期", identifiers)
+
+    def test_outlier_numeric_filter_excludes_final_id_columns(self):
+        df = pd.DataFrame(
+            {
+                "销售工号": [1001, 1002, 1003, 1004],
+                "amount": [10, 11, 12, 1000],
+                "price": [1, 2, 3, 4],
+            }
+        )
+        final_ids = get_final_id_columns(
+            df,
+            auto_id_columns=[],
+            manual_id_columns=["price"],
+            manual_non_id_columns=["销售工号"],
+        )
+
+        numeric_columns = get_iqr_numeric_measure_columns(df, final_ids)
+
+        self.assertNotIn("price", numeric_columns)
+        self.assertIn("amount", numeric_columns)
+
+    def test_outlier_numeric_filter_uses_final_id_columns_after_manual_cancel(self):
+        df = pd.DataFrame(
+            {
+                "amount": [10, 11, 12, 1000],
+                "price": [1, 2, 3, 4],
+            }
+        )
+        final_ids = get_final_id_columns(
+            df,
+            auto_id_columns=["amount"],
+            manual_id_columns=[],
+            manual_non_id_columns=["amount"],
+        )
+
+        numeric_columns = get_iqr_numeric_measure_columns(df, final_ids)
+
+        self.assertNotIn("amount", final_ids)
+        self.assertIn("amount", numeric_columns)
 
     def test_quality_overview_and_repair_suggestions(self):
         df = pd.DataFrame(

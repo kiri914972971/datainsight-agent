@@ -137,12 +137,14 @@ from src.services.data_quality_service import (
     format_duplicate_handling_plan,
     format_missing_value_plan,
     generate_data_repair_suggestions_for_quality,
+    get_final_id_columns,
     get_iqr_numeric_measure_columns,
     get_cleaned_dataset_metadata,
     load_cleaned_dataset,
     missing_sample_preview,
     missing_value_plan_to_operations,
     remove_missing_value_plan_item,
+    reset_id_override_state,
     set_cleaned_dataset_as_current,
     summarize_duplicates_for_quality,
     summarize_duplicate_handling_effect,
@@ -151,6 +153,7 @@ from src.services.data_quality_service import (
     summarize_missing_values_for_quality,
     summarize_missing_value_plan_effect,
     summarize_quality_overview,
+    update_id_override_state,
     upsert_duplicate_handling_plan,
     upsert_missing_value_plan_item,
 )
@@ -1551,9 +1554,9 @@ def render_project_data_quality_tab(project_id: str) -> None:
     st.subheader("生成清洗数据集")
     if operations:
         st.caption(f"待执行处理步骤：{len(operations)} 个")
-        st.json(operations, expanded=False)
+        st.caption("详细处理内容已在上方清洗计划摘要中展示；点击按钮会生成独立的 cleaned_dataset.csv。")
     else:
-        st.caption("当前未选择处理步骤；仍可生成与当前数据相同的清洗数据集副本。")
+        st.caption("当前没有待执行处理步骤，可以直接保留当前数据集。")
 
     if st.button(
         "生成清洗数据集",
@@ -1755,7 +1758,29 @@ def render_project_data_quality_tab(project_id: str) -> None:
             return f"{operation.get('column', '-')}：{method_labels.get(operation.get('method'), operation.get('method'))}"
         return str(operation)
 
-    identifier_columns = detect_quality_identifier_columns(quality_df)
+    auto_identifier_columns = detect_quality_identifier_columns(quality_df)
+    if st.session_state.get("manual_id_columns_project_id") != project_id:
+        st.session_state.manual_id_columns_project_id = project_id
+        st.session_state.manual_id_columns = []
+        st.session_state.manual_non_id_columns = []
+    manual_id_columns = [
+        column
+        for column in st.session_state.setdefault("manual_id_columns", [])
+        if column in quality_df.columns
+    ]
+    manual_non_id_columns = [
+        column
+        for column in st.session_state.setdefault("manual_non_id_columns", [])
+        if column in quality_df.columns
+    ]
+    st.session_state.manual_id_columns = manual_id_columns
+    st.session_state.manual_non_id_columns = manual_non_id_columns
+    identifier_columns = get_final_id_columns(
+        quality_df,
+        auto_identifier_columns,
+        manual_id_columns,
+        manual_non_id_columns,
+    )
     invalid_columns = detect_quality_invalid_columns(quality_df)
     outlier_summary = summarize_iqr_outliers_for_quality(quality_df, identifier_columns)
     quality_overview = summarize_quality_overview(
@@ -1814,7 +1839,7 @@ def render_project_data_quality_tab(project_id: str) -> None:
         overview_bottom = st.columns(6)
         overview_bottom[0].metric("缺失值总数", f"{quality_overview['missing_values']:,}")
         overview_bottom[1].metric("重复行数量", f"{quality_overview['duplicate_rows']:,}")
-        overview_bottom[2].metric("疑似ID字段数量", quality_overview["identifier_column_count"])
+        overview_bottom[2].metric("最终排除ID字段数", quality_overview["identifier_column_count"])
         overview_bottom[3].metric("异常字段数量", quality_overview["suspicious_column_count"])
         overview_bottom[4].metric("异常值字段数", outlier_field_count)
         overview_bottom[5].metric("异常值数量", f"{quality_overview['outlier_count']:,}")
@@ -2112,12 +2137,104 @@ def render_project_data_quality_tab(project_id: str) -> None:
 
     with id_tab:
         st.markdown("#### ID字段识别")
-        st.caption("ID字段通常只用于定位记录，不适合做均值、偏度、异常值检测、相关性分析、箱线图或数值分布图。")
-        identifier_summary = summarize_identifier_columns(quality_df, identifier_columns)
+        st.caption("ID字段通常用于定位记录，不适合做均值、偏度、异常值检测、相关性分析、箱线图或数值分布图。")
+        identifier_summary = summarize_identifier_columns(quality_df, auto_identifier_columns)
         if identifier_summary.empty:
-            st.info("当前未识别到疑似 ID 字段。")
+            st.info("当前未自动识别到疑似 ID 字段。")
         else:
+            status_map = {}
+            for column in auto_identifier_columns:
+                if column in manual_non_id_columns:
+                    status_map[column] = "已人工取消ID"
+                elif column in manual_id_columns:
+                    status_map[column] = "已人工标记为ID"
+                else:
+                    status_map[column] = "自动识别为ID"
+            identifier_summary["当前状态"] = identifier_summary["字段名"].map(status_map).fillna("自动识别为ID")
             st.dataframe(identifier_summary, use_container_width=True, hide_index=True)
+
+        st.markdown("#### 人工调整 ID 字段")
+        adjustment_cols = st.columns([2, 2, 1])
+        selected_id_column = adjustment_cols[0].selectbox(
+            "选择字段",
+            list(quality_df.columns),
+            key=f"project_quality_id_override_column_{project_id}",
+        )
+        selected_id_action = adjustment_cols[1].selectbox(
+            "操作",
+            ["标记为 ID 字段", "取消 ID 标记"],
+            key=f"project_quality_id_override_action_{project_id}",
+        )
+        if adjustment_cols[2].button(
+            "应用调整",
+            type="primary",
+            key=f"project_quality_apply_id_override_{project_id}",
+        ):
+            action = "mark_id" if selected_id_action == "标记为 ID 字段" else "mark_non_id"
+            manual_ids, manual_non_ids = update_id_override_state(
+                quality_df,
+                st.session_state.get("manual_id_columns", []),
+                st.session_state.get("manual_non_id_columns", []),
+                selected_id_column,
+                action,
+            )
+            st.session_state.manual_id_columns = manual_ids
+            st.session_state.manual_non_id_columns = manual_non_ids
+            st.rerun()
+
+        final_id_rows = []
+        for column in identifier_columns:
+            if column in manual_id_columns:
+                source = "人工标记"
+            else:
+                source = "自动识别"
+            final_id_rows.append({"字段名": column, "来源": source, "状态": "最终排除"})
+        st.markdown("#### 当前最终排除字段")
+        if final_id_rows:
+            st.dataframe(pd.DataFrame(final_id_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("当前没有最终排除的 ID 字段。")
+
+        cancelled_auto_ids = [
+            column for column in manual_non_id_columns if column in auto_identifier_columns
+        ]
+        st.markdown("#### 已人工取消 ID 标记字段")
+        if cancelled_auto_ids:
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {"字段名": column, "来源": "自动识别后人工取消", "状态": "参与数值分析"}
+                        for column in cancelled_auto_ids
+                    ]
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("暂无人工取消的 ID 标记字段。")
+
+        cancelled_still_excluded_from_iqr = [
+            column
+            for column in manual_non_id_columns
+            if column in quality_df.columns
+            and pd.api.types.is_numeric_dtype(quality_df[column])
+            and column not in get_iqr_numeric_measure_columns(quality_df, identifier_columns)
+        ]
+        if cancelled_still_excluded_from_iqr:
+            st.caption(
+                "以下字段已取消 ID 标记，但字段名仍命中工号、编号、单号等排除规则，"
+                f"不会进入异常值字段下拉框：{', '.join(map(str, cancelled_still_excluded_from_iqr))}"
+            )
+
+        if st.button(
+            "重置人工调整",
+            key=f"project_quality_reset_id_override_{project_id}",
+        ):
+            manual_ids, manual_non_ids = reset_id_override_state()
+            st.session_state.manual_id_columns = manual_ids
+            st.session_state.manual_non_id_columns = manual_non_ids
+            st.rerun()
+
         if invalid_columns:
             st.warning(f"检测到疑似无效字段：{', '.join(map(str, invalid_columns))}。建议确认业务含义后处理。")
 
@@ -2256,6 +2373,26 @@ def render_project_data_quality_tab(project_id: str) -> None:
         else:
             st.dataframe(missing_plan_table, use_container_width=True, hide_index=True)
 
+        st.markdown("##### ID字段调整")
+        id_adjustment_rows = [
+            {
+                "配置项": "最终排除字段",
+                "字段": ", ".join(map(str, identifier_columns)) if identifier_columns else "无",
+            },
+            {
+                "配置项": "人工标记为ID",
+                "字段": ", ".join(map(str, manual_id_columns)) if manual_id_columns else "无",
+            },
+            {
+                "配置项": "人工取消ID标记",
+                "字段": ", ".join(map(str, manual_non_id_columns)) if manual_non_id_columns else "无",
+            },
+        ]
+        if manual_id_columns or manual_non_id_columns:
+            st.dataframe(pd.DataFrame(id_adjustment_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("暂无人工 ID 字段调整。")
+
         duplicate_plan_table = format_duplicate_handling_plan(
             st.session_state.get("duplicate_handling_plan"),
             quality_df,
@@ -2324,9 +2461,9 @@ def render_project_data_quality_tab(project_id: str) -> None:
         st.info("所有处理都会生成 cleaned_dataset.csv，不覆盖原始上传文件、合并数据集或分析数据集。")
         if operations:
             st.caption(f"待执行处理步骤：{len(operations)} 个")
-            st.json(operations, expanded=False)
+            st.caption("详细处理内容已在上方清洗计划总览和预计处理影响中展示；点击按钮会生成独立的 cleaned_dataset.csv。")
         else:
-            st.caption("当前未选择处理步骤；仍可生成与当前数据相同的 cleaned_dataset.csv 副本。")
+            st.caption("当前没有待执行处理步骤，可以直接保留当前数据集。")
 
         if st.button(
             "生成清洗数据集",

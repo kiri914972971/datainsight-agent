@@ -145,7 +145,17 @@ def _looks_like_date_column(series: pd.Series, column: str | None = None) -> boo
 
 def _is_measure_name(column: str) -> bool:
     normalized = str(column).strip().lower()
-    return any(hint in normalized for hint in MEASURE_NAME_HINTS)
+    business_measure_hints = (
+        "成交金额",
+        "客单价",
+        "金额",
+        "销售额",
+        "单价",
+        "成本",
+        "利润",
+        "数量",
+    )
+    return any(hint in normalized for hint in (*MEASURE_NAME_HINTS, *business_measure_hints))
 
 
 def identifier_reason(df: pd.DataFrame, column: str) -> str | None:
@@ -179,6 +189,80 @@ def detect_identifier_columns(
         for column in df.columns
         if column not in excluded and identifier_reason(df, column) is not None
     ]
+
+
+def normalize_id_override_state(
+    df: pd.DataFrame,
+    manual_id_columns: list[str] | None = None,
+    manual_non_id_columns: list[str] | None = None,
+) -> tuple[list[str], list[str]]:
+    columns = list(df.columns)
+    valid_columns = set(columns)
+    manual_non_ids = [
+        column
+        for column in manual_non_id_columns or []
+        if column in valid_columns
+    ]
+    manual_ids = [
+        column
+        for column in manual_id_columns or []
+        if column in valid_columns and column not in manual_non_ids
+    ]
+    return list(dict.fromkeys(manual_ids)), list(dict.fromkeys(manual_non_ids))
+
+
+def reset_id_override_state() -> tuple[list[str], list[str]]:
+    return [], []
+
+
+def update_id_override_state(
+    df: pd.DataFrame,
+    manual_id_columns: list[str] | None,
+    manual_non_id_columns: list[str] | None,
+    column: str,
+    action: str,
+) -> tuple[list[str], list[str]]:
+    manual_ids, manual_non_ids = normalize_id_override_state(
+        df,
+        manual_id_columns,
+        manual_non_id_columns,
+    )
+    if column not in df.columns:
+        return manual_ids, manual_non_ids
+
+    if action == "mark_id":
+        manual_ids = [*manual_ids, column]
+        manual_non_ids = [item for item in manual_non_ids if item != column]
+    elif action == "mark_non_id":
+        manual_non_ids = [*manual_non_ids, column]
+        manual_ids = [item for item in manual_ids if item != column]
+
+    return list(dict.fromkeys(manual_ids)), list(dict.fromkeys(manual_non_ids))
+
+
+def get_final_id_columns(
+    df: pd.DataFrame,
+    auto_id_columns: list[str] | None = None,
+    manual_id_columns: list[str] | None = None,
+    manual_non_id_columns: list[str] | None = None,
+) -> list[str]:
+    columns = list(df.columns)
+    manual_ids, manual_non_ids = normalize_id_override_state(
+        df,
+        manual_id_columns,
+        manual_non_id_columns,
+    )
+    auto_ids = [
+        column
+        for column in (
+            auto_id_columns
+            if auto_id_columns is not None
+            else detect_identifier_columns(df)
+        )
+        if column in df.columns
+    ]
+    final_ids = (set(auto_ids) | set(manual_ids)) - set(manual_non_ids)
+    return [column for column in columns if column in final_ids]
 
 
 def summarize_identifier_columns(df: pd.DataFrame, identifier_columns: list[str]) -> pd.DataFrame:
