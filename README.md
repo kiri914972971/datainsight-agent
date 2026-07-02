@@ -1,114 +1,208 @@
-# DataInsight Agent
+# DataInsight Agent（数据分析助手）
 
-DataInsight Agent is a Streamlit-based data analysis assistant designed for business users, analysts, and data-oriented product teams. It helps users upload tabular data, inspect quality issues, explore trends, generate charts, define metrics, and export reusable analysis outputs without building a full BI pipeline first.
+> 一款面向数据分析师、业务分析师及产品团队的 AI 数据分析助手。
+>
+> 从 Excel/CSV 数据上传，到数据质量检查、多表建模、探索分析、Dashboard 与报告导出，帮助用户完成完整的数据分析流程。
 
-> Status: MVP / Work in Progress
+**Status：MVP 已完成，持续迭代中**
 
-## Project Overview
+---
 
-DataInsight Agent focuses on the early-stage analytics workflow: getting from a raw CSV or Excel file to a trustworthy business-facing insight. The project combines data profiling, quality checks, exploratory analysis, metric management, relationship modeling, and report/dashboard export into one local application.
+# 项目背景
 
-The current version is a working MVP with multiple analysis engines and service-layer tests. It is still evolving toward a more polished, modular analytics workspace.
+日常数据分析通常需要在 Excel、Python、BI 工具之间频繁切换，数据清洗、指标管理、报表生成等流程分散，分析效率较低。
 
-## Target Users
+DataInsight Agent 将数据上传、数据质量检查、字段映射、表关系、多表分析、探索分析、业务分析、Dashboard 及报告导出整合到同一套 Streamlit 工作流中，帮助分析人员更高效地完成分析任务。
 
-- Business analysts who need to inspect unfamiliar datasets quickly.
-- Operations, sales, or product teams that work with spreadsheet-heavy reporting.
-- Founders or small teams that need lightweight analytics before investing in a full BI stack.
-- Job portfolio reviewers who want to see applied data product thinking, not only isolated scripts.
+---
 
-## Core Pain Points
+# 核心功能
 
-- Raw spreadsheet data often contains missing values, inconsistent fields, duplicate records, and unclear business meaning.
-- Non-technical users need analysis guidance, not just charts.
-- Many small-team analytics workflows are scattered across Excel files, notebooks, screenshots, and manual reports.
-- Metric definitions, field mappings, and table relationships are easy to lose when analysis is repeated.
+✅ 数据上传与预览（CSV / XLSX / XLS）
 
-## Core Features
+✅ 数据质量检查
+- 缺失值分析
+- 重复值分析
+- 异常值检测
+- ID 字段识别
+- 数据修复
 
-- Data upload and preview for CSV, XLSX, and XLS files.
-- Automatic field type detection and dataset profiling.
-- Data quality checks for missing values, duplicates, outliers, ID-like fields, and suspicious columns.
-- Exploratory data analysis with descriptive statistics and chart suggestions.
-- Business question analysis for common metric and dimension breakdowns.
-- Metric dictionary and KPI center for reusable business definitions.
-- Field mapping and table relationship engines for multi-table analysis preparation.
-- Dashboard and report export workflows, including Excel/PowerPoint/Word-oriented templates.
-- Optional AI-assisted insight generation through user-provided API settings.
+✅ 多表数据建模
+- 字段映射
+- 表关系配置
+- JOIN 计划生成
+- 分析数据集构建
 
-## Tech Stack
+✅ KPI 中心
+- KPI 管理
+- 指标定义
+- 自动候选字段
+- 聚合方式配置
+
+✅ 探索分析
+- 描述统计
+- 分类分析
+- 相关分析
+- 图表可视化
+
+✅ Dashboard 与报告
+- Dashboard 自动生成
+- Excel 导出
+- Word 导出
+- AI 分析接口（支持用户自定义模型/API）
+
+---
+
+# 项目截图
+
+## 数据分析集
+
+![Analysis Dataset UI](docs/analysis-dataset-ui.png)
+
+---
+
+## KPI 中心
+
+![KPI Center UI](docs/kpi-center-ui.png)
+
+---
+
+## Dashboard
+
+![Business Question UI](docs/business-question-ui.png)
+
+---
+
+## 业务问题解析
+
+![Dashboard Engine UI](docs/phase12-dashboard-engine-ui.png)
+
+---
+
+# 技术栈
 
 - Python
 - Streamlit
-- pandas
+- Pandas
 - Plotly
-- openpyxl / xlrd
-- python-docx / python-pptx
-- pytest
+- OpenPyXL
+- Python-docx
+- Python-pptx
+- Pytest
 
-## Project Structure
+---
 
-```text
+# 项目亮点
+
+我希望通过这个项目探索 AI 如何帮助分析师完成重复的数据处理工作，而不是替代分析师进行业务决策。因此整个产品围绕真实的数据分析流程设计，而非单独展示机器学习模型。
+
+相比传统 Notebook 或单一分析脚本，本项目更关注完整的数据分析工作流设计。
+
+目前已实现：
+
+- 数据上传
+- 数据质量管理
+- 字段映射
+- 表关系管理
+- KPI 管理
+- 分析数据集生成
+- 探索分析
+- Dashboard
+- 业务问题解析
+- 报告导出
+- AI 模型配置（支持自定义 API）
+
+整个流程围绕真实分析师的使用场景进行设计，而不仅仅展示单个算法或模型。
+
+---
+
+# 项目结构
+
+```
 DataInsightAgent/
-├── app.py                    # Streamlit application entry point
-├── requirements.txt          # Python dependencies
-├── src/                      # Core services, engines, exporters, and utilities
-├── tests/                    # Regression and service-layer tests
-├── docs/                     # Product notes, architecture, specs, and screenshots
-├── templates/                # Export templates
-├── outputs/                  # Local generated outputs, ignored except .gitkeep
-└── workspace/                # Local runtime workspace, ignored except .gitkeep
+│
+├── app.py                  # Streamlit 入口
+├── src/                    # 核心业务逻辑
+├── templates/              # 导出模板
+├── tests/                  # 单元测试
+├── docs/                   # 产品文档与截图
+├── outputs/                # 导出结果
+└── workspace/              # 本地项目工作区
 ```
 
-## Screenshots
+---
 
-Screenshots are stored under `docs/` and can be used in a portfolio case study.
+# 快速开始
 
-![Analysis Dataset UI](docs/analysis-dataset-ui.png)
-![Business Question UI](docs/business-question-ui.png)
-![KPI Center UI](docs/kpi-center-ui.png)
-![Dashboard Engine UI](docs/phase12-dashboard-engine-ui.png)
+```bash
+python -m venv .venv
 
-## Setup
-
-```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
 pip install -r requirements.txt
+
 streamlit run app.py
 ```
 
-Python 3.11 or 3.12 is recommended. Python 3.13 may have compatibility issues with some data analysis packages.
+推荐使用 Python 3.11 或 Python 3.12。
 
-## AI Usage
+---
 
-AI features are optional. The application accepts an API key, model name, and base URL from the UI when the user wants AI-assisted insight generation. Secrets should be provided at runtime or through local-only configuration files and should never be committed to the repository.
+# AI 配置
 
-## Current Progress
+AI 功能采用运行时配置。
 
-- MVP application is implemented in Streamlit.
-- Core engines and services are organized under `src/`.
-- Regression tests exist for analysis datasets, append workflows, data quality, KPI logic, relationship modeling, dashboard generation, and business question analysis.
-- Documentation includes product requirements, architecture notes, implementation specs, and handoff materials.
+用户可在应用界面中配置：
 
-## Roadmap
+- API Key
+- Base URL
+- Model Name
 
-- Improve onboarding and sample-data experience for first-time users.
-- Add clearer project/session management around uploaded datasets.
-- Expand data lineage and reproducibility for generated reports.
-- Improve AI prompt governance, error handling, and provider configuration.
-- Add more portfolio-ready screenshots and a short demo walkthrough.
-- Continue refactoring large UI sections into smaller, testable modules.
+不会将任何密钥写入仓库。
 
-## GitHub Publishing Notes
+---
 
-Before publishing publicly:
+# 当前进度
 
-- Do not commit `.env`, `.streamlit/secrets.toml`, virtual environments, browser debug folders, logs, local outputs, or private workspace data.
-- Review any sample spreadsheets or generated reports for private business data.
-- Keep API keys and model provider settings outside Git history.
+✅ 已完成
 
-## License
+- 数据上传
+- 数据质量模块
+- 字段映射
+- 表关系
+- KPI 中心
+- 分析数据集
+- Dashboard
+- 报告导出
+- AI 接口配置
 
-No license has been selected yet. Add a license before encouraging external reuse.
+🚧 持续开发中
+
+- AI 自动分析
+- Dashboard 模板扩展
+- 更多数据源接入
+- 企业级工作流优化
+
+---
+
+# 项目定位
+
+本项目定位为个人作品集（Portfolio Project）。
+
+重点展示：
+
+- 数据分析产品设计能力
+- Python 工程能力
+- Streamlit 应用开发能力
+- 数据建模与分析流程设计能力
+- AI Agent 产品设计思路
+
+---
+
+# English Summary
+
+**DataInsight Agent** is a Streamlit-based AI data analysis assistant designed for business analysts and product teams.
+
+It integrates data upload, data quality inspection, relationship modeling, KPI management, exploratory analysis, dashboard generation, and report export into one analytics workflow.
+
+This project is built as a portfolio demonstrating product thinking, Python engineering, and data analytics workflow design.
+
+---
