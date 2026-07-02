@@ -2668,6 +2668,130 @@ def replace_relationship_record(
     ]
 
 
+def _relationship_dataset_type_label(dataset_type: str | None) -> str:
+    return {
+        "uploaded": "原始上传",
+        "appended": "合并结果",
+        "cleaned": "清洗结果",
+        "joined": "关联结果",
+    }.get(str(dataset_type or ""), "其他数据集")
+
+
+def _relationship_table_option_label(table: dict) -> str:
+    dataset_type = str(table.get("dataset_type") or "")
+    label = _relationship_dataset_type_label(dataset_type)
+    table_name = str(table.get("dataset_name") or table.get("table_name") or "-")
+    rows = int(table.get("rows") or 0)
+    columns = int(table.get("columns") or 0)
+    size_text = f"{rows}行 × {columns}列"
+    if dataset_type == "joined":
+        return f"【{label}】{table_name}（来自表关系生成，{size_text}）"
+    return f"【{label}】{table_name}（{size_text}）"
+
+
+def _relationship_table_fields(
+    project_id: str,
+    table_id: str,
+    show_all_fields: bool,
+) -> tuple[list[str], bool]:
+    all_fields = get_project_table_columns(project_id, table_id, connectable_only=False)
+    if show_all_fields:
+        return all_fields, False
+    connectable_fields = get_project_table_columns(
+        project_id,
+        table_id,
+        connectable_only=True,
+        fallback_to_all=False,
+    )
+    if connectable_fields:
+        return connectable_fields, False
+    return all_fields, True
+
+
+def _relationship_source_label(source: str | None) -> str:
+    return {
+        "auto": "自动推荐",
+        "manual": "手动",
+    }.get(str(source or ""), "其他")
+
+
+def _relationship_dataset_type_summary(relationship: dict) -> str:
+    table_a_type = _relationship_dataset_type_label(
+        relationship.get("table_a_dataset_type")
+    )
+    table_b_type = _relationship_dataset_type_label(
+        relationship.get("table_b_dataset_type")
+    )
+    return f"{table_a_type} ↔ {table_b_type}"
+
+
+def _relationship_display_name(relationship: dict) -> str:
+    return (
+        f"{relationship.get('table_a_name', '-')}.{relationship.get('field_a', '-')} ↔ "
+        f"{relationship.get('table_b_name', '-')}.{relationship.get('field_b', '-')}"
+    )
+
+
+def _relationship_table_rows(relationships: list[dict]) -> list[dict]:
+    return [
+        {
+            "关系": _relationship_display_name(item),
+            "表A": item.get("table_a_name", ""),
+            "字段A": item.get("field_a", ""),
+            "表B": item.get("table_b_name", ""),
+            "字段B": item.get("field_b", ""),
+            "关系类型": item.get("relationship_type", ""),
+            "来源": _relationship_source_label(item.get("source")),
+            "置信度": f"{float(item.get('confidence') or 0):.0f}%",
+            "数据集类型": _relationship_dataset_type_summary(item),
+        }
+        for item in relationships
+    ]
+
+
+def _relationship_candidate_groups(candidates: list[dict]) -> dict[str, list[dict]]:
+    sorted_candidates = sorted(
+        candidates,
+        key=lambda item: float(item.get("confidence") or 0),
+        reverse=True,
+    )
+    return {
+        "high": [
+            item for item in sorted_candidates if float(item.get("confidence") or 0) >= 90
+        ],
+        "medium": [
+            item
+            for item in sorted_candidates
+            if 75 <= float(item.get("confidence") or 0) < 90
+        ],
+        "low": [
+            item
+            for item in sorted_candidates
+            if 70 <= float(item.get("confidence") or 0) < 75
+        ],
+    }
+
+
+def _relationship_candidate_advice(confidence: float) -> str:
+    if confidence >= 90:
+        return "建议接受"
+    if confidence >= 75:
+        return "建议检查"
+    return "谨慎使用"
+
+
+def _relationship_candidate_rows(candidates: list[dict]) -> list[dict]:
+    return [
+        {
+            "选择": index,
+            "关系": _relationship_display_name(item),
+            "可信度": f"{float(item.get('confidence') or 0):.0f}%",
+            "建议": _relationship_candidate_advice(float(item.get("confidence") or 0)),
+        }
+        for index, item in enumerate(candidates, start=1)
+    ]
+
+
 def relationship_used_in_analysis_dataset(
     project_id: str,
     relationship_ids: set[str],
@@ -2734,90 +2858,98 @@ def render_table_relationship_tab(project_id: str) -> None:
     editing_relationship_id = st.session_state.get(editing_key)
     editing_relationship = relationship_by_id.get(editing_relationship_id)
     if saved_relationships:
-        st.success(f"已加载项目表关系，共 {len(saved_relationships)} 条。")
+        manual_count = sum(1 for item in saved_relationships if item.get("source") == "manual")
+        auto_count = sum(1 for item in saved_relationships if item.get("source") == "auto")
         st.markdown("#### 已保存关系")
-        header_columns = st.columns([1.2, 1, 0.2, 1.2, 1, 0.9, 0.8, 1.4])
-        for column, label in zip(
-            header_columns,
-            ["表A", "连接字段A", "↔", "表B", "连接字段B", "关系类型", "来源", "操作"],
+        st.caption(f"共 {len(saved_relationships)} 条关系｜手动 {manual_count} 条｜推荐 {auto_count} 条")
+        st.dataframe(
+            _relationship_table_rows(saved_relationships),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        relationship_options = [
+            item["relationship_id"]
+            for item in saved_relationships
+            if item.get("relationship_id")
+        ]
+        selected_relationship_id = st.selectbox(
+            "选择要操作的关系",
+            relationship_options,
+            format_func=lambda value: _relationship_display_name(relationship_by_id[value]),
+            key=f"selected_relationship_action_{project_id}",
+        )
+        selected_relationship = relationship_by_id.get(selected_relationship_id)
+        action_columns = st.columns([1, 1, 1, 3])
+        if action_columns[0].button(
+            "编辑选中关系",
+            disabled=selected_relationship is None,
+            key=f"edit_selected_relationship_{project_id}",
+            use_container_width=True,
         ):
-            column.markdown(f"**{label}**")
-        for index, item in enumerate(saved_relationships):
-            with st.container(border=True):
-                row_columns = st.columns([1.2, 1, 0.2, 1.2, 1, 0.9, 0.8, 1.4])
-                row_columns[0].write(item["table_a_name"])
-                row_columns[1].write(item["field_a"])
-                row_columns[2].write("↔")
-                row_columns[3].write(item["table_b_name"])
-                row_columns[4].write(item["field_b"])
-                row_columns[5].write(item["relationship_type"])
-                row_columns[6].write("自动推荐" if item["source"] == "auto" else "手动")
-                action_columns = row_columns[7].columns(2)
-                if action_columns[0].button(
-                    "编辑",
-                    key=f"edit_relationship_{project_id}_{item['relationship_id']}",
-                    use_container_width=True,
-                ):
-                    st.session_state[editing_key] = item["relationship_id"]
-                    st.session_state.relationship_message = "已进入关系编辑模式，请在下方修改后保存。"
-                    st.rerun()
-                if action_columns[1].button(
-                    "删除",
-                    key=f"request_delete_relationship_{project_id}_{item['relationship_id']}",
-                    use_container_width=True,
-                ):
-                    st.session_state[pending_delete_key] = item["relationship_id"]
-                    st.rerun()
-
-                if st.session_state.get(pending_delete_key) == item["relationship_id"]:
-                    st.warning(
-                        "确认删除该表关系？删除后不会影响原始数据，但后续分析数据集需要重新生成。"
-                    )
-                    confirm_columns = st.columns([1, 1, 4])
-                    if confirm_columns[0].button(
-                        "确认删除",
-                        type="primary",
-                        key=f"do_delete_relationship_{project_id}_{item['relationship_id']}",
-                        use_container_width=True,
-                    ):
-                        was_used = relationship_used_in_analysis_dataset(
-                            project_id,
-                            {item["relationship_id"]},
-                        )
-                        delete_table_relationship(project_id, item["relationship_id"])
-                        if st.session_state.get(editing_key) == item["relationship_id"]:
-                            st.session_state.pop(editing_key, None)
-                        st.session_state.pop(pending_delete_key, None)
-                        st.session_state.relationship_message = (
-                            "表关系已删除。表关系已变更，请重新生成分析数据集。"
-                            if was_used
-                            else "表关系已删除，请重新生成分析数据集。"
-                        )
-                        st.rerun()
-                    if confirm_columns[1].button(
-                        "取消",
-                        key=f"cancel_delete_relationship_{project_id}_{item['relationship_id']}",
-                        use_container_width=True,
-                    ):
-                        st.session_state.pop(pending_delete_key, None)
-                        st.rerun()
-
-        st.markdown("#### 批量操作")
-        if st.button(
+            st.session_state[editing_key] = selected_relationship_id
+            st.session_state.pop(pending_delete_key, None)
+            st.session_state.pop(pending_clear_key, None)
+            st.session_state.relationship_message = "已进入关系编辑模式，请在下方修改后保存。"
+            st.rerun()
+        if action_columns[1].button(
+            "删除选中关系",
+            disabled=selected_relationship is None,
+            key=f"request_delete_selected_relationship_{project_id}",
+            use_container_width=True,
+        ):
+            st.session_state[pending_delete_key] = selected_relationship_id
+            st.session_state.pop(pending_clear_key, None)
+            st.rerun()
+        if action_columns[2].button(
             "清空全部关系",
             key=f"request_clear_relationships_{project_id}",
+            use_container_width=True,
         ):
             st.session_state[pending_clear_key] = True
+            st.session_state.pop(pending_delete_key, None)
             st.rerun()
+
+        pending_delete_id = st.session_state.get(pending_delete_key)
+        if pending_delete_id and pending_delete_id in relationship_by_id:
+            st.warning("确认删除该表关系？删除不会影响数据源，但后续分析数据集需要重新生成。")
+            confirm_columns = st.columns([1, 1, 4])
+            if confirm_columns[0].button(
+                "确认删除",
+                type="primary",
+                key=f"do_delete_relationship_{project_id}",
+                use_container_width=True,
+            ):
+                was_used = relationship_used_in_analysis_dataset(
+                    project_id,
+                    {pending_delete_id},
+                )
+                delete_table_relationship(project_id, pending_delete_id)
+                if st.session_state.get(editing_key) == pending_delete_id:
+                    st.session_state.pop(editing_key, None)
+                st.session_state.pop(pending_delete_key, None)
+                st.session_state.relationship_message = (
+                    "表关系已删除。表关系已变更，请重新生成分析数据集。"
+                    if was_used
+                    else "表关系已删除，请重新生成分析数据集。"
+                )
+                st.rerun()
+            if confirm_columns[1].button(
+                "取消",
+                key=f"cancel_delete_relationship_{project_id}",
+                use_container_width=True,
+            ):
+                st.session_state.pop(pending_delete_key, None)
+                st.rerun()
+
         if st.session_state.get(pending_clear_key):
-            st.warning(
-                "确认清空全部表关系？删除后不会影响原始数据，但后续分析数据集需要重新生成。"
-            )
+            st.warning("确认清空全部表关系？删除不会影响数据源，但后续分析数据集需要重新生成。")
             clear_columns = st.columns([1, 1, 4])
             if clear_columns[0].button(
                 "确认清空",
                 type="primary",
                 key=f"do_clear_relationships_{project_id}",
+                use_container_width=True,
             ):
                 was_used = relationship_used_in_analysis_dataset(
                     project_id,
@@ -2836,9 +2968,12 @@ def render_table_relationship_tab(project_id: str) -> None:
             if clear_columns[1].button(
                 "取消",
                 key=f"cancel_clear_relationships_{project_id}",
+                use_container_width=True,
             ):
                 st.session_state.pop(pending_clear_key, None)
                 st.rerun()
+    else:
+        st.info("暂无已保存关系。你可以接受高可信推荐，或在下方手动配置。")
 
     st.subheader("推荐关系")
     project = get_project(project_id)
@@ -2847,29 +2982,74 @@ def render_table_relationship_tab(project_id: str) -> None:
             project_id,
             project.get("updated_at", project.get("last_modified", "")),
         )
+    candidate_groups = _relationship_candidate_groups(candidates)
+    high_confidence_candidates = candidate_groups["high"]
+    sorted_candidates = (
+        candidate_groups["high"]
+        + candidate_groups["medium"]
+        + candidate_groups["low"]
+    )
+    candidate_by_id = {item["relationship_id"]: item for item in sorted_candidates}
     if candidates:
-        st.dataframe(
-            [
-                {
-                    "推荐": "✓",
-                    "表A": item["table_a_name"],
-                    "连接字段A": item["field_a"],
-                    "↔": "↔",
-                    "表B": item["table_b_name"],
-                    "连接字段B": item["field_b"],
-                    "置信度": f"{item['confidence']:.0f}%",
-                    "推荐依据": item["reason"],
-                }
-                for item in candidates
-            ],
-            use_container_width=True,
-            hide_index=True,
+        st.caption(
+            f"系统发现 {len(candidates)} 条可能关系，其中 {len(high_confidence_candidates)} 条高可信。"
         )
+        summary_actions = st.columns([1, 1, 3])
+        if summary_actions[0].button(
+            "一键接受高可信推荐",
+            disabled=not high_confidence_candidates,
+            type="primary",
+            use_container_width=True,
+            key=f"accept_high_confidence_relationships_{project_id}",
+        ):
+            save_table_relationships(
+                project_id,
+                merge_relationship_records(saved_relationships, high_confidence_candidates),
+            )
+            st.session_state.relationship_message = (
+                f"已保存 {len(high_confidence_candidates)} 条高可信推荐关系。"
+                "表关系已变更，请重新生成分析数据集。"
+            )
+            st.rerun()
+        show_recommendation_details = summary_actions[1].checkbox(
+            "查看推荐详情",
+            value=False,
+            key=f"show_relationship_recommendation_details_{project_id}",
+        )
+        if not high_confidence_candidates:
+            st.info("暂无高可信推荐，可查看详情或手动配置。")
     else:
         st.info("暂未发现评分达到 70 分的推荐关系，你仍可以手动配置。")
 
-    candidate_options = ["manual"] + [item["relationship_id"] for item in candidates]
-    candidate_by_id = {item["relationship_id"]: item for item in candidates}
+    if candidates and show_recommendation_details:
+        for group_key, title, expanded in (
+            ("high", "高可信推荐", True),
+            ("medium", "中可信推荐", False),
+            ("low", "低可信推荐", False),
+        ):
+            group_candidates = candidate_groups[group_key]
+            with st.expander(f"{title}（{len(group_candidates)} 条）", expanded=expanded):
+                if not group_candidates:
+                    st.caption("暂无该组推荐。")
+                    continue
+                st.dataframe(
+                    _relationship_candidate_rows(group_candidates),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                reason_candidate_id = st.selectbox(
+                    "查看推荐依据",
+                    [item["relationship_id"] for item in group_candidates],
+                    format_func=lambda value: _relationship_display_name(
+                        candidate_by_id[value]
+                    ),
+                    key=f"relationship_recommendation_reason_{project_id}_{group_key}",
+                )
+                reason_candidate = candidate_by_id.get(reason_candidate_id)
+                if reason_candidate:
+                    st.caption(reason_candidate.get("reason", "暂无推荐依据。"))
+
+    candidate_options = ["manual"] + [item["relationship_id"] for item in sorted_candidates]
     selected_candidate_id = st.selectbox(
         "选择推荐关系或手动配置",
         candidate_options,
@@ -2887,35 +3067,27 @@ def render_table_relationship_tab(project_id: str) -> None:
         key=f"relationship_candidate_{project_id}",
     )
     selected_candidate = candidate_by_id.get(selected_candidate_id)
-    recommendation_actions = st.columns(2)
-    if recommendation_actions[0].button(
-        "接受当前推荐",
-        disabled=selected_candidate is None,
-        type="primary",
-        use_container_width=True,
-        key=f"accept_current_relationship_{project_id}",
-    ):
-        save_table_relationships(
-            project_id,
-            merge_relationship_records(saved_relationships, [selected_candidate]),
-        )
-        st.session_state.relationship_message = "当前推荐关系已保存到项目。"
-        st.rerun()
-    if recommendation_actions[1].button(
-        "一键接受全部推荐",
-        disabled=not candidates,
-        use_container_width=True,
-        key=f"accept_all_relationships_{project_id}",
-    ):
-        save_table_relationships(
-            project_id,
-            merge_relationship_records(saved_relationships, candidates),
-        )
-        st.session_state.relationship_message = f"已保存 {len(candidates)} 条推荐关系。"
-        st.rerun()
+    if candidates and show_recommendation_details:
+        if st.button(
+            "接受当前推荐",
+            disabled=selected_candidate is None,
+            type="primary",
+            key=f"accept_current_relationship_{project_id}",
+        ):
+            save_table_relationships(
+                project_id,
+                merge_relationship_records(saved_relationships, [selected_candidate]),
+            )
+            st.session_state.relationship_message = "当前推荐关系已保存到项目。"
+            st.rerun()
 
     st.subheader("手动配置")
     st.caption("手动配置默认仅展示 ID、日期和高唯一值字段；金额等业务指标不会作为关系推荐。")
+    show_all_fields = st.checkbox(
+        "显示全部字段",
+        value=False,
+        key=f"relationship_show_all_fields_{project_id}",
+    )
     if editing_relationship:
         st.info(
             f"正在编辑：{editing_relationship['table_a_name']}.{editing_relationship['field_a']} ↔ "
@@ -2930,14 +3102,19 @@ def render_table_relationship_tab(project_id: str) -> None:
     table_by_id = {table["table_id"]: table for table in tables}
     table_ids = list(table_by_id)
     active_relationship = selected_candidate or editing_relationship
+    if active_relationship and (
+        active_relationship.get("table_a_id") not in table_by_id
+        or active_relationship.get("table_b_id") not in table_by_id
+    ):
+        st.error("当前关系引用的数据集已不存在，请重新选择表A和表B后保存。")
     table_a_default = (
-        active_relationship["table_a_id"]
-        if active_relationship and active_relationship["table_a_id"] in table_ids
+        active_relationship.get("table_a_id")
+        if active_relationship and active_relationship.get("table_a_id") in table_ids
         else table_ids[0]
     )
     table_b_default = (
-        active_relationship["table_b_id"]
-        if active_relationship and active_relationship["table_b_id"] in table_ids
+        active_relationship.get("table_b_id")
+        if active_relationship and active_relationship.get("table_b_id") in table_ids
         else table_ids[1]
     )
     control_key = selected_candidate_id if selected_candidate else (editing_relationship_id or "manual")
@@ -2946,17 +3123,20 @@ def render_table_relationship_tab(project_id: str) -> None:
         "表A",
         table_ids,
         index=table_ids.index(table_a_default),
-        format_func=lambda value: (
-            f"{table_by_id[value]['table_name']} · {table_by_id[value]['file_name']}"
-        ),
+        format_func=lambda value: _relationship_table_option_label(table_by_id[value]),
         key=f"relationship_table_a_{project_id}_{control_key}",
     )
-    fields_a = get_project_table_columns(project_id, table_a_id, connectable_only=True)
+    fields_a, fallback_a = _relationship_table_fields(project_id, table_a_id, show_all_fields)
+    if fallback_a:
+        st.caption("表A未识别到推荐连接字段，已自动显示全部字段。")
+    if not fields_a:
+        st.error("表A没有可选择的字段，请检查数据集。")
+        return
     field_a_default = (
-        active_relationship["field_a"]
+        active_relationship.get("field_a")
         if active_relationship
-        and active_relationship["table_a_id"] == table_a_id
-        and active_relationship["field_a"] in fields_a
+        and active_relationship.get("table_a_id") == table_a_id
+        and active_relationship.get("field_a") in fields_a
         else fields_a[0]
     )
     field_a = relationship_columns[1].selectbox(
@@ -2970,17 +3150,20 @@ def render_table_relationship_tab(project_id: str) -> None:
         "表B",
         table_ids,
         index=table_ids.index(table_b_default),
-        format_func=lambda value: (
-            f"{table_by_id[value]['table_name']} · {table_by_id[value]['file_name']}"
-        ),
+        format_func=lambda value: _relationship_table_option_label(table_by_id[value]),
         key=f"relationship_table_b_{project_id}_{control_key}",
     )
-    fields_b = get_project_table_columns(project_id, table_b_id, connectable_only=True)
+    fields_b, fallback_b = _relationship_table_fields(project_id, table_b_id, show_all_fields)
+    if fallback_b:
+        st.caption("表B未识别到推荐连接字段，已自动显示全部字段。")
+    if not fields_b:
+        st.error("表B没有可选择的字段，请检查数据集。")
+        return
     field_b_default = (
-        active_relationship["field_b"]
+        active_relationship.get("field_b")
         if active_relationship
-        and active_relationship["table_b_id"] == table_b_id
-        and active_relationship["field_b"] in fields_b
+        and active_relationship.get("table_b_id") == table_b_id
+        and active_relationship.get("field_b") in fields_b
         else fields_b[0]
     )
     field_b = relationship_columns[4].selectbox(
@@ -3006,6 +3189,11 @@ def render_table_relationship_tab(project_id: str) -> None:
         format_func=lambda value: relationship_type_labels[value],
         key=f"relationship_type_{project_id}_{control_key}",
     )
+    if (
+        table_by_id[table_a_id].get("dataset_type") == "joined"
+        or table_by_id[table_b_id].get("dataset_type") == "joined"
+    ):
+        st.warning("你正在使用表关系生成结果继续建模，请确认不会重复 JOIN 已包含的字段。")
 
     if st.button(
         "确认并保存关系",
@@ -3030,42 +3218,36 @@ def render_table_relationship_tab(project_id: str) -> None:
                 "table_a_file_id": table_a["file_id"],
                 "table_a_file_name": table_a["file_name"],
                 "table_a_sheet_name": table_a["sheet_name"],
+                "table_a_dataset_type": table_a.get("dataset_type"),
+                "table_a_source": table_a.get("source"),
+                "table_a_file_path": table_a.get("file_path"),
                 "field_a": field_a,
                 "table_b_id": table_b_id,
                 "table_b_name": table_b["table_name"],
                 "table_b_file_id": table_b["file_id"],
                 "table_b_file_name": table_b["file_name"],
                 "table_b_sheet_name": table_b["sheet_name"],
+                "table_b_dataset_type": table_b.get("dataset_type"),
+                "table_b_source": table_b.get("source"),
+                "table_b_file_path": table_b.get("file_path"),
                 "field_b": field_b,
                 "relationship_type": selected_relationship_type,
                 "confidence": (
                     selected_candidate["confidence"]
                     if selected_candidate
-                    else editing_relationship.get("confidence", 0)
-                    if editing_relationship
                     else 0
                 ),
                 "score_breakdown": (
                     selected_candidate.get("score_breakdown", {})
                     if selected_candidate
-                    else editing_relationship.get("score_breakdown", {})
-                    if editing_relationship
                     else {}
                 ),
                 "reason": (
                     selected_candidate["reason"]
                     if selected_candidate
-                    else "用户手动编辑"
-                    if editing_relationship
                     else "用户手动确认"
                 ),
-                "source": (
-                    "auto"
-                    if selected_candidate
-                    else editing_relationship.get("source", "manual")
-                    if editing_relationship
-                    else "manual"
-                ),
+                "source": "manual",
             }
             if editing_relationship:
                 save_table_relationships(

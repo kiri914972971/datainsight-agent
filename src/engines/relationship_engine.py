@@ -155,6 +155,13 @@ def _table_fields(prefix: str, table: dict[str, Any], column: str) -> dict[str, 
         f"{prefix}_file_id": table["file_id"],
         f"{prefix}_file_name": table["file_name"],
         f"{prefix}_sheet_name": table["sheet_name"],
+        f"{prefix}_dataset_id": table.get("dataset_id", table["table_id"]),
+        f"{prefix}_dataset_name": table.get("dataset_name", table["table_name"]),
+        f"{prefix}_dataset_type": table.get("dataset_type", ""),
+        f"{prefix}_source": table.get("source", ""),
+        f"{prefix}_file_path": table.get("file_path", ""),
+        f"{prefix}_is_generated": table.get("is_generated", False),
+        f"{prefix}_source_files": table.get("source_files", []),
         f"field_{prefix[-1]}": column,
     }
 

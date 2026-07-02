@@ -19,6 +19,7 @@ htmlcov/
 .env
 .env.*
 .streamlit/secrets.toml
+.streamlit/secrets.toml.*
 
 # Streamlit runtime logs
 streamlit*.log
@@ -34,6 +35,7 @@ streamlit*.log
 
 # Logs and temporary files
 *.log
+*.log.*
 *.tmp
 *.bak
 temp/
@@ -41,6 +43,8 @@ tmp/
 .Rhistory
 
 # Generated outputs
+dist/
+build/
 outputs/*
 !outputs/.gitkeep
 outputs/*.log
@@ -49,8 +53,16 @@ outputs/temp/
 outputs/tmp/
 
 # Workspace runtime data
+workspace/logs/
 workspace/projects/*
 !workspace/projects/.gitkeep
+
+# Frontend dependencies and caches
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 
 # Editor and operating-system files
 .vscode/

@@ -11,9 +11,9 @@ from src.engines.relationship_engine import (
     connectable_columns,
     discover_relationship_candidates,
 )
-from src.services.data_source_service import (
-    list_project_data_files,
-    load_project_data_file,
+from src.services.current_dataset_service import (
+    list_project_datasets,
+    load_project_dataset_dataframe,
 )
 from src.services.field_mapping_service import load_field_mappings
 
@@ -24,25 +24,14 @@ RELATIONSHIP_TYPES = ("one_to_one", "one_to_many", "many_to_one", "many_to_many"
 
 def list_project_tables(project_id: str) -> list[dict[str, Any]]:
     tables = []
-    for file_metadata in list_project_data_files(project_id):
-        for sheet in file_metadata.get("sheets", []):
-            sheet_name = sheet["sheet_name"]
-            tables.append(
-                {
-                    "table_id": _table_id(file_metadata["file_id"], sheet_name),
-                    "table_name": (
-                        Path(file_metadata["file_name"]).stem
-                        if file_metadata["file_type"] == "csv"
-                        else sheet_name
-                    ),
-                    "file_id": file_metadata["file_id"],
-                    "file_name": file_metadata["file_name"],
-                    "sheet_name": sheet_name,
-                    "rows": sheet.get("rows", 0),
-                    "columns": sheet.get("columns", 0),
-                }
-            )
+    for dataset in list_project_datasets(project_id):
+        tables.append(_dataset_to_table(dataset))
     return tables
+
+
+def load_relationship_table_dataframe(project_id: str, table_id: str):
+    _find_table(project_id, table_id)
+    return load_project_dataset_dataframe(project_id, table_id)
 
 
 def discover_project_relationships(project_id: str) -> list[dict[str, Any]]:
@@ -50,7 +39,7 @@ def discover_project_relationships(project_id: str) -> list[dict[str, Any]]:
     tables = []
     for table in list_project_tables(project_id):
         try:
-            dataframe = load_project_data_file(project_id, table["file_id"], table["sheet_name"])
+            dataframe = load_relationship_table_dataframe(project_id, table["table_id"])
         except Exception:
             continue
         tables.append(
@@ -67,12 +56,12 @@ def get_project_table_columns(
     project_id: str,
     table_id: str,
     connectable_only: bool = False,
+    fallback_to_all: bool = True,
 ) -> list[str]:
-    table = _find_table(project_id, table_id)
-    dataframe = load_project_data_file(project_id, table["file_id"], table["sheet_name"])
+    dataframe = load_relationship_table_dataframe(project_id, table_id)
     if connectable_only:
         candidates = connectable_columns(dataframe, _field_mapping_overrides(project_id))
-        if candidates:
+        if candidates or not fallback_to_all:
             return candidates
     return [str(column) for column in dataframe.columns]
 
@@ -81,7 +70,10 @@ def save_table_relationships(
     project_id: str,
     relationships: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    normalized = [_normalize_relationship(item) for item in relationships]
+    normalized = [
+        _hydrate_relationship_metadata(project_id, _normalize_relationship(item))
+        for item in relationships
+    ]
     _validate_relationships(project_id, normalized)
     config_path = _relationship_path(project_id)
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -140,10 +132,16 @@ def _validate_relationships(project_id: str, relationships: list[dict[str, Any]]
         table_b_id = relationship["table_b_id"]
         if table_a_id == table_b_id:
             raise ValueError("表A和表B不能是同一个数据表。")
-        if relationship["field_a"] not in table_columns.get(table_a_id, set()):
+        if table_a_id not in table_columns:
+            raise ValueError(f"表A不存在或无法读取：{table_a_id}")
+        if table_b_id not in table_columns:
+            raise ValueError(f"表B不存在或无法读取：{table_b_id}")
+        if relationship["field_a"] not in table_columns[table_a_id]:
             raise ValueError(f"表A连接字段不存在：{relationship['field_a']}")
-        if relationship["field_b"] not in table_columns.get(table_b_id, set()):
+        if relationship["field_b"] not in table_columns[table_b_id]:
             raise ValueError(f"表B连接字段不存在：{relationship['field_b']}")
+    if _has_relationship_cycle(relationships):
+        raise ValueError("该关系会造成循环依赖，请调整表关系。")
 
 
 def _normalize_relationship(relationship: dict[str, Any]) -> dict[str, Any]:
@@ -164,13 +162,27 @@ def _normalize_relationship(relationship: dict[str, Any]) -> dict[str, Any]:
         "table_a_name": str(migrated.get("table_a_name", "")),
         "table_a_file_id": str(migrated.get("table_a_file_id", "")),
         "table_a_file_name": str(migrated.get("table_a_file_name", "")),
-        "table_a_sheet_name": str(migrated.get("table_a_sheet_name", "")),
+        "table_a_sheet_name": _optional_str(migrated.get("table_a_sheet_name")),
+        "table_a_dataset_id": str(migrated.get("table_a_dataset_id") or migrated["table_a_id"]),
+        "table_a_dataset_name": str(migrated.get("table_a_dataset_name", "")),
+        "table_a_dataset_type": str(migrated.get("table_a_dataset_type", "")),
+        "table_a_source": str(migrated.get("table_a_source", "")),
+        "table_a_file_path": str(migrated.get("table_a_file_path", "")),
+        "table_a_is_generated": bool(migrated.get("table_a_is_generated", False)),
+        "table_a_source_files": migrated.get("table_a_source_files", []),
         "field_a": str(migrated["field_a"]),
         "table_b_id": str(migrated["table_b_id"]),
         "table_b_name": str(migrated.get("table_b_name", "")),
         "table_b_file_id": str(migrated.get("table_b_file_id", "")),
         "table_b_file_name": str(migrated.get("table_b_file_name", "")),
-        "table_b_sheet_name": str(migrated.get("table_b_sheet_name", "")),
+        "table_b_sheet_name": _optional_str(migrated.get("table_b_sheet_name")),
+        "table_b_dataset_id": str(migrated.get("table_b_dataset_id") or migrated["table_b_id"]),
+        "table_b_dataset_name": str(migrated.get("table_b_dataset_name", "")),
+        "table_b_dataset_type": str(migrated.get("table_b_dataset_type", "")),
+        "table_b_source": str(migrated.get("table_b_source", "")),
+        "table_b_file_path": str(migrated.get("table_b_file_path", "")),
+        "table_b_is_generated": bool(migrated.get("table_b_is_generated", False)),
+        "table_b_source_files": migrated.get("table_b_source_files", []),
         "field_b": str(migrated["field_b"]),
         "relationship_type": relationship_type,
         "confidence": round(confidence, 2),
@@ -209,6 +221,83 @@ def _find_table(project_id: str, table_id: str) -> dict[str, Any]:
     raise FileNotFoundError(f"项目数据表不存在：{table_id}")
 
 
+def _dataset_to_table(dataset: dict[str, Any]) -> dict[str, Any]:
+    dataset_id = str(dataset.get("dataset_id", ""))
+    dataset_name = str(dataset.get("dataset_name") or dataset_id)
+    dataset_type = str(dataset.get("dataset_type") or "uploaded")
+    sheet_name = dataset.get("sheet_name")
+    file_name = str(dataset.get("file_name") or dataset_name)
+    return {
+        "table_id": dataset_id,
+        "table_name": dataset_name,
+        "file_id": str(dataset.get("source_file_id") or dataset_id),
+        "file_name": file_name,
+        "sheet_name": sheet_name,
+        "rows": int(dataset.get("row_count") or dataset.get("rows") or 0),
+        "columns": int(dataset.get("column_count") or dataset.get("columns") or 0),
+        "dataset_id": dataset_id,
+        "dataset_name": dataset_name,
+        "dataset_type": dataset_type,
+        "source": str(dataset.get("source") or dataset_type),
+        "file_path": str(dataset.get("file_path") or ""),
+        "is_generated": dataset_type != "uploaded",
+        "source_files": dataset.get("source_files", []) or [],
+    }
+
+
+def _hydrate_relationship_metadata(
+    project_id: str,
+    relationship: dict[str, Any],
+) -> dict[str, Any]:
+    table_by_id = {table["table_id"]: table for table in list_project_tables(project_id)}
+    hydrated = dict(relationship)
+    for side in ("a", "b"):
+        table = table_by_id.get(hydrated.get(f"table_{side}_id"))
+        if not table:
+            continue
+        hydrated[f"table_{side}_name"] = hydrated.get(f"table_{side}_name") or table["table_name"]
+        hydrated[f"table_{side}_file_id"] = hydrated.get(f"table_{side}_file_id") or table["file_id"]
+        hydrated[f"table_{side}_file_name"] = hydrated.get(f"table_{side}_file_name") or table["file_name"]
+        hydrated[f"table_{side}_sheet_name"] = hydrated.get(f"table_{side}_sheet_name") or table["sheet_name"]
+        hydrated[f"table_{side}_dataset_id"] = table["dataset_id"]
+        hydrated[f"table_{side}_dataset_name"] = table["dataset_name"]
+        hydrated[f"table_{side}_dataset_type"] = table["dataset_type"]
+        hydrated[f"table_{side}_source"] = table["source"]
+        hydrated[f"table_{side}_file_path"] = table["file_path"]
+        hydrated[f"table_{side}_is_generated"] = table["is_generated"]
+        hydrated[f"table_{side}_source_files"] = table["source_files"]
+    return hydrated
+
+
+def _has_relationship_cycle(relationships: list[dict[str, Any]]) -> bool:
+    graph: dict[str, set[str]] = {}
+    for relationship in relationships:
+        table_a_id = str(relationship.get("table_a_id", ""))
+        table_b_id = str(relationship.get("table_b_id", ""))
+        if not table_a_id or not table_b_id:
+            continue
+        graph.setdefault(table_a_id, set()).add(table_b_id)
+        graph.setdefault(table_b_id, set())
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(table_id: str) -> bool:
+        if table_id in visiting:
+            return True
+        if table_id in visited:
+            return False
+        visiting.add(table_id)
+        for next_table_id in graph.get(table_id, set()):
+            if visit(next_table_id):
+                return True
+        visiting.remove(table_id)
+        visited.add(table_id)
+        return False
+
+    return any(visit(table_id) for table_id in graph)
+
+
 def _field_mapping_overrides(project_id: str) -> dict[str, str]:
     try:
         mappings = load_field_mappings(project_id)
@@ -227,6 +316,12 @@ def _table_id(file_id: str, sheet_name: str) -> str:
 
 def _relationship_path(project_id: str) -> Path:
     return project_workspace.get_project_path(project_id) / "config" / RELATIONSHIP_FILE
+
+
+def _optional_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(value)
 
 
 def _utc_now() -> str:

@@ -1,66 +1,114 @@
 # DataInsight Agent
 
-DataInsight Agent 是一个面向数据分析师和非技术用户的 Streamlit 数据分析 MVP。上传 CSV、XLSX 或 XLS 文件后，可以自动查看数据概览、EDA、交互图表、执行常用清洗、运行规则式查询并导出 Word 报告。
+DataInsight Agent is a Streamlit-based data analysis assistant designed for business users, analysts, and data-oriented product teams. It helps users upload tabular data, inspect quality issues, explore trends, generate charts, define metrics, and export reusable analysis outputs without building a full BI pipeline first.
 
-## 项目结构
+> Status: MVP / Work in Progress
+
+## Project Overview
+
+DataInsight Agent focuses on the early-stage analytics workflow: getting from a raw CSV or Excel file to a trustworthy business-facing insight. The project combines data profiling, quality checks, exploratory analysis, metric management, relationship modeling, and report/dashboard export into one local application.
+
+The current version is a working MVP with multiple analysis engines and service-layer tests. It is still evolving toward a more polished, modular analytics workspace.
+
+## Target Users
+
+- Business analysts who need to inspect unfamiliar datasets quickly.
+- Operations, sales, or product teams that work with spreadsheet-heavy reporting.
+- Founders or small teams that need lightweight analytics before investing in a full BI stack.
+- Job portfolio reviewers who want to see applied data product thinking, not only isolated scripts.
+
+## Core Pain Points
+
+- Raw spreadsheet data often contains missing values, inconsistent fields, duplicate records, and unclear business meaning.
+- Non-technical users need analysis guidance, not just charts.
+- Many small-team analytics workflows are scattered across Excel files, notebooks, screenshots, and manual reports.
+- Metric definitions, field mappings, and table relationships are easy to lose when analysis is repeated.
+
+## Core Features
+
+- Data upload and preview for CSV, XLSX, and XLS files.
+- Automatic field type detection and dataset profiling.
+- Data quality checks for missing values, duplicates, outliers, ID-like fields, and suspicious columns.
+- Exploratory data analysis with descriptive statistics and chart suggestions.
+- Business question analysis for common metric and dimension breakdowns.
+- Metric dictionary and KPI center for reusable business definitions.
+- Field mapping and table relationship engines for multi-table analysis preparation.
+- Dashboard and report export workflows, including Excel/PowerPoint/Word-oriented templates.
+- Optional AI-assisted insight generation through user-provided API settings.
+
+## Tech Stack
+
+- Python
+- Streamlit
+- pandas
+- Plotly
+- openpyxl / xlrd
+- python-docx / python-pptx
+- pytest
+
+## Project Structure
 
 ```text
-data_insight_agent/
-├── app.py                    # Streamlit 主页面
-├── requirements.txt          # Python 依赖
-├── README.md                 # 使用说明
-├── src/
-│   ├── data_loader.py        # CSV / Excel 读取
-│   ├── type_detector.py      # 字段识别与日期解析
-│   ├── eda.py                # EDA 统计
-│   ├── data_quality.py       # 数据质量评分、异常字段与 ID 识别
-│   ├── eda_ai_complete.py    # EDA 业务洞察、截断检测与自动续写
-│   ├── visualizer.py         # Plotly 图表
-│   ├── cleaner.py            # 数据清洗
-│   ├── export_service.py     # CSV / XLSX / XLS 导出
-│   ├── ai_connection.py      # AI 接口连接测试
-│   ├── query_engine.py       # 规则式查询
-│   └── report_generator.py   # Word 报告
-└── outputs/                  # 可选的本地输出目录
+DataInsightAgent/
+├── app.py                    # Streamlit application entry point
+├── requirements.txt          # Python dependencies
+├── src/                      # Core services, engines, exporters, and utilities
+├── tests/                    # Regression and service-layer tests
+├── docs/                     # Product notes, architecture, specs, and screenshots
+├── templates/                # Export templates
+├── outputs/                  # Local generated outputs, ignored except .gitkeep
+└── workspace/                # Local runtime workspace, ignored except .gitkeep
 ```
 
-## Windows 安装与运行
+## Screenshots
 
-请先确认电脑已经安装 Python 3.11 或 3.12。Python 3.13 可能与部分数据分析包存在兼容问题。
+Screenshots are stored under `docs/` and can be used in a portfolio case study.
+
+![Analysis Dataset UI](docs/analysis-dataset-ui.png)
+![Business Question UI](docs/business-question-ui.png)
+![KPI Center UI](docs/kpi-center-ui.png)
+![Dashboard Engine UI](docs/phase12-dashboard-engine-ui.png)
+
+## Setup
 
 ```powershell
 py -3.12 -m venv .venv
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-如果 `py -3.12` 不可用，安装 Python 后，在安装界面勾选 **Add Python to PATH**。
+Python 3.11 or 3.12 is recommended. Python 3.13 may have compatibility issues with some data analysis packages.
 
-## 功能测试
+## AI Usage
 
-1. 上传一个包含数值、类别和日期字段的 CSV 或 Excel。
-2. 在“数据预览”检查字段类型是否正确。
-3. 在“探索性分析”检查缺失值、数值统计、异常值和智能洞察。
-4. 在“可视化”切换不同交互图表。
-5. 从左侧执行清洗，并在“数据清洗”检查处理前后对比。
-6. 在“数据清洗”将处理后的数据导出为 CSV、XLSX 或 XLS。所有处理只修改当前会话副本，不会覆盖原始文件。
-7. 在“简单查询”选择字段并运行 Top N 查询。
-8. 在“报告导出”下载并打开 Word 报告。
+AI features are optional. The application accepts an API key, model name, and base URL from the UI when the user wants AI-assisted insight generation. Secrets should be provided at runtime or through local-only configuration files and should never be committed to the repository.
 
-## AI 深度分析
+## Current Progress
 
-在左侧“AI 接入”区域填写自己的 API Key、模型和 API 地址，然后在“探索性分析”中点击“生成 AI 深度分析”。API Key 仅保存在当前浏览器会话中，不会写入项目文件。
+- MVP application is implemented in Streamlit.
+- Core engines and services are organized under `src/`.
+- Regression tests exist for analysis datasets, append workflows, data quality, KPI logic, relationship modeling, dashboard generation, and business question analysis.
+- Documentation includes product requirements, architecture notes, implementation specs, and handoff materials.
 
-点击“测试 AI 连接”后，页面会明确显示接入成功或失败原因。默认使用 OpenAI Responses API，若服务不支持则自动尝试 OpenAI 兼容的 Chat Completions API，因此也可配置 DeepSeek 等兼容接口。未填写 API Key 时，应用仍会基于偏度、峰度、异常值和类别频率自动生成本地分析建议。
+## Roadmap
 
-## 常见问题
+- Improve onboarding and sample-data experience for first-time users.
+- Add clearer project/session management around uploaded datasets.
+- Expand data lineage and reproducibility for generated reports.
+- Improve AI prompt governance, error handling, and provider configuration.
+- Add more portfolio-ready screenshots and a short demo walkthrough.
+- Continue refactoring large UI sections into smaller, testable modules.
 
-- **无法激活虚拟环境**：先运行 `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`，再激活。
-- **提示找不到 Python / py**：重新安装 Python，并勾选添加到 PATH；然后重启 VS Code。
-- **Excel 读取失败**：确认已安装 `openpyxl` 和 `xlrd`，并检查文件是否损坏。
-- **CSV 中文乱码**：程序会依次尝试 UTF-8、GB18030 和 Latin-1；仍失败时请用 Excel 将文件另存为 UTF-8 CSV。
-- **日期未被识别**：建议字段名包含 `date`、`time`、`日期` 或 `时间`，并确保至少 80% 的非空值可解析。
-- **端口被占用**：运行 `streamlit run app.py --server.port 8502`。
+## GitHub Publishing Notes
+
+Before publishing publicly:
+
+- Do not commit `.env`, `.streamlit/secrets.toml`, virtual environments, browser debug folders, logs, local outputs, or private workspace data.
+- Review any sample spreadsheets or generated reports for private business data.
+- Keep API keys and model provider settings outside Git history.
+
+## License
+
+No license has been selected yet. Add a license before encouraging external reuse.

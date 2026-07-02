@@ -14,12 +14,12 @@ from src.services.current_dataset_service import (
     load_current_analysis_dataframe,
     set_current_analysis_dataset,
 )
-from src.services.data_source_service import load_project_data_file
 from src.services.field_mapping_service import load_field_mappings
 from src.services.kpi_service import load_kpi_definitions
 from src.services.metric_dictionary_service import load_metric_dictionary
 from src.services.relationship_service import (
     list_project_tables,
+    load_relationship_table_dataframe,
     load_table_relationships,
 )
 
@@ -445,11 +445,7 @@ def _load_project_table_frames(project_id: str) -> dict[str, dict[str, Any]]:
     tables = {}
     for table in list_project_tables(project_id):
         try:
-            dataframe = load_project_data_file(
-                project_id,
-                table["file_id"],
-                table["sheet_name"],
-            )
+            dataframe = load_relationship_table_dataframe(project_id, table["table_id"])
         except Exception:
             continue
         tables[table["table_id"]] = {**table, "dataframe": dataframe}
@@ -462,7 +458,7 @@ def _select_base_table_id(
     table_frames: dict[str, dict[str, Any]],
 ) -> str:
     current = get_current_analysis_dataset(project_id) or {}
-    if current.get("dataset_type") == "uploaded" and current.get("dataset_id"):
+    if current.get("dataset_id"):
         current_table_id = current["dataset_id"]
         if current_table_id in table_frames:
             return current_table_id
@@ -478,7 +474,7 @@ def _build_current_base_table(
 ) -> dict[str, Any]:
     current = get_current_analysis_dataset(project_id) or {}
     current_table_id = current.get("dataset_id")
-    if current.get("dataset_type") == "uploaded" and current_table_id in table_frames:
+    if current_table_id in table_frames:
         return table_frames[current_table_id]
     if current.get("file_path"):
         dataframe = load_current_analysis_dataframe(project_id)
