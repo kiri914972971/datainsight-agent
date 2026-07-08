@@ -1,5 +1,6 @@
 import hashlib
 import json
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -174,6 +175,17 @@ from src.services.append_service import (
 from src.services.business_question_service import (
     load_question_parse_history,
     parse_question_for_project,
+)
+from src.services.analytics_tracking_service import (
+    cleaned_dataset_properties,
+    data_quality_properties,
+    dataset_context,
+    dataset_properties,
+    report_export_properties,
+    safe_track_event,
+    short_error_message,
+    track_event_once,
+    upload_event_inputs,
 )
 from src.services.field_mapping_service import (
     confirmed_columns_by_type,
@@ -788,6 +800,15 @@ def render_appended_dataset_summary(
         ):
             try:
                 selection = set_appended_dataset_as_current(project_id)
+                _track_dataset_selected_once(
+                    project_id,
+                    {
+                        "dataset_id": selection.get("file_id"),
+                        "dataset_type": "appended",
+                        "row_count": selection.get("row_count"),
+                        "column_count": selection.get("column_count"),
+                    },
+                )
                 clear_active_analysis()
                 message = f"已将“合并数据集 {selection['file_name']}”设为当前分析数据集。"
                 st.session_state.data_source_message = message
@@ -852,6 +873,86 @@ def _dataset_option_label(dataset: dict, current_selection: dict | None) -> str:
     rows = int(dataset.get("row_count") or 0)
     columns = int(dataset.get("column_count") or 0)
     return f"{current_prefix}{type_prefix} {dataset.get('dataset_name', '-')} · {rows:,}行 × {columns:,}列"
+
+
+def _track_dataset_selected_once(project_id: str, dataset: dict | None) -> None:
+    if not dataset:
+        return
+    dataset_id = str(dataset.get("dataset_id") or "")
+    if not dataset_id:
+        return
+    track_event_once(
+        st.session_state,
+        f"analytics_last_dataset_selected_{project_id}",
+        f"{project_id}:{dataset_id}",
+        "dataset_selected",
+        properties=dataset_properties(dataset),
+        context=dataset_context(project_id, dataset),
+    )
+
+
+def _track_report_export_click_success(
+    export_type: str,
+    export_bytes: bytes,
+    *,
+    current_dataset: dict | None,
+    duration_ms: int | float | None = None,
+    has_quality_summary: bool | None = None,
+    has_charts: bool | None = None,
+) -> None:
+    context = dataset_context(active_project_id, current_dataset)
+    clicked_properties = report_export_properties(
+        export_type,
+        dataset=current_dataset,
+        has_quality_summary=has_quality_summary,
+        has_charts=has_charts,
+    )
+    success_properties = report_export_properties(
+        export_type,
+        dataset=current_dataset,
+        file_size=len(export_bytes),
+        has_quality_summary=has_quality_summary,
+        has_charts=has_charts,
+    )
+    safe_track_event("report_export_clicked", properties=clicked_properties, context=context)
+    safe_track_event(
+        "report_export_success",
+        properties=success_properties,
+        context=context,
+        duration_ms=duration_ms,
+    )
+
+
+def _track_report_export_failure_once(
+    export_type: str,
+    error: Exception,
+    *,
+    current_dataset: dict | None,
+) -> None:
+    seen_key = "analytics_report_export_failed_seen"
+    fingerprint = (
+        f"{active_project_id}:"
+        f"{(current_dataset or {}).get('dataset_id')}:"
+        f"{export_type}:"
+        f"{type(error).__name__}:"
+        f"{short_error_message(error)}"
+    )
+    seen = set(st.session_state.get(seen_key, []))
+    if fingerprint in seen:
+        return
+    safe_track_event(
+        "report_export_failed",
+        properties=report_export_properties(
+            export_type,
+            dataset=current_dataset,
+            error_message=error,
+        ),
+        context=dataset_context(active_project_id, current_dataset),
+        success=False,
+        error_type="export_error",
+    )
+    seen.add(fingerprint)
+    st.session_state[seen_key] = sorted(seen)
 
 
 def _dataset_source_description(dataset: dict) -> str:
@@ -1103,11 +1204,27 @@ def render_data_source_tab(project_id: str) -> None:
     ):
         try:
             saved = save_project_data_files(project_id, uploaded_files)
+            for context, properties in upload_event_inputs(project_id, saved):
+                safe_track_event(
+                    "dataset_uploaded",
+                    properties=properties,
+                    context=context,
+                )
             st.session_state.data_source_message = (
                 f"已保存 {len(saved)} 个项目数据文件，并注册为项目数据集。"
             )
             st.rerun()
         except Exception as exc:
+            safe_track_event(
+                "dataset_uploaded",
+                properties={
+                    "file_count": len(uploaded_files or []),
+                    "dataset_type": "uploaded",
+                },
+                context={"project_id": project_id},
+                success=False,
+                error_type="upload_error",
+            )
             st.error(f"文件保存失败：{exc}")
 
     message = st.session_state.pop("data_source_message", None)
@@ -1199,7 +1316,8 @@ def render_data_source_tab(project_id: str) -> None:
         use_container_width=True,
         key=f"set_current_dataset_{project_id}_{selected_dataset_id}",
     ):
-        set_current_analysis_dataset(project_id, selected_dataset)
+        selected_dataset = set_current_analysis_dataset(project_id, selected_dataset)
+        _track_dataset_selected_once(project_id, selected_dataset)
         clear_active_analysis()
         st.session_state.data_source_message = (
             f"已将“{selected_dataset.get('dataset_name', '-')}”设为当前分析数据集。"
@@ -1808,6 +1926,20 @@ def render_project_data_quality_tab(project_id: str) -> None:
         outlier_summary.loc[outlier_summary["异常值数量"] > 0, "字段名"].astype(str).tolist()
         if not outlier_summary.empty
         else []
+    )
+    track_event_once(
+        st.session_state,
+        f"analytics_data_quality_viewed_{project_id}",
+        f"{project_id}:{current_dataset.get('dataset_id')}",
+        "data_quality_viewed",
+        properties=data_quality_properties(
+            current_dataset,
+            quality_overview,
+            row_count=len(quality_df),
+            column_count=len(quality_df.columns),
+            outlier_field_count=outlier_field_count,
+        ),
+        context=dataset_context(project_id, current_dataset),
     )
     if st.session_state.get("missing_value_plan_project_id") != project_id:
         st.session_state.missing_value_plan_project_id = project_id
@@ -2471,12 +2603,58 @@ def render_project_data_quality_tab(project_id: str) -> None:
             key=f"project_quality_create_cleaned_v2_{project_id}",
         ):
             try:
+                started_at = time.perf_counter()
                 metadata = create_cleaned_dataset(project_id, operations)
+                duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+                outlier_steps = [operation for operation in operations if operation.get("type") == "outlier"]
+                _cleaned_context = {
+                    "project_id": project_id,
+                    "dataset_id": metadata.get("dataset_id"),
+                    "dataset_type": metadata.get("dataset_type"),
+                }
+                safe_track_event(
+                    "cleaned_dataset_generated",
+                    properties=cleaned_dataset_properties(
+                        metadata,
+                        missing_plan_step_count=len(st.session_state.get("missing_value_plan", [])),
+                        duplicate_plan_enabled=bool(
+                            (st.session_state.get("duplicate_handling_plan") or {}).get("method")
+                            not in {None, "none"}
+                        ),
+                        id_override_count=len(st.session_state.get("manual_id_columns", []))
+                        + len(st.session_state.get("manual_non_id_columns", [])),
+                        outlier_plan_step_count=len(outlier_steps),
+                    ),
+                    context=_cleaned_context,
+                    duration_ms=duration_ms,
+                )
                 st.session_state.project_quality_message = (
                     f"已生成 cleaned_dataset.csv：{metadata['before_rows']:,} 行 -> {metadata['after_rows']:,} 行。"
                 )
                 st.rerun()
             except Exception as exc:
+                safe_track_event(
+                    "cleaned_dataset_generated",
+                    properties={
+                        "source_dataset_id": current_dataset.get("dataset_id"),
+                        "source_dataset_type": current_dataset.get("dataset_type"),
+                        "missing_plan_step_count": len(st.session_state.get("missing_value_plan", [])),
+                        "duplicate_plan_enabled": bool(
+                            (st.session_state.get("duplicate_handling_plan") or {}).get("method")
+                            not in {None, "none"}
+                        ),
+                        "id_override_count": len(st.session_state.get("manual_id_columns", []))
+                        + len(st.session_state.get("manual_non_id_columns", [])),
+                        "outlier_plan_step_count": len(
+                            [operation for operation in operations if operation.get("type") == "outlier"]
+                        ),
+                        "before_row_count": len(quality_df),
+                        "before_column_count": len(quality_df.columns),
+                    },
+                    context=dataset_context(project_id, current_dataset),
+                    success=False,
+                    error_type="cleaning_error",
+                )
                 st.error(f"清洗数据集生成失败：{exc}")
 
         message = st.session_state.pop("project_quality_message", None)
@@ -2513,7 +2691,8 @@ def render_project_data_quality_tab(project_id: str) -> None:
                     type="primary",
                     key=f"project_quality_set_cleaned_current_v2_{project_id}",
                 ):
-                    set_cleaned_dataset_as_current(project_id)
+                    selected_cleaned_dataset = set_cleaned_dataset_as_current(project_id)
+                    _track_dataset_selected_once(project_id, selected_cleaned_dataset)
                     clear_active_analysis()
                     st.session_state.project_quality_message = "已将 cleaned_dataset.csv 设为当前分析数据集。"
                     st.rerun()
@@ -5833,6 +6012,7 @@ with delivery_tabs[0]:
         st.markdown("### 下载 Excel 数据包")
         st.caption("包含处理后数据、数据质量摘要、数值统计、类别统计和业务分析结果。")
         try:
+            export_started_at = time.perf_counter()
             full_excel = export_full_excel_report(
                 df,
                 report_quality_summary,
@@ -5840,15 +6020,30 @@ with delivery_tabs[0]:
                 report_categorical_summary,
                 report_business_result,
             )
-            st.download_button(
+            export_duration_ms = round((time.perf_counter() - export_started_at) * 1000, 2)
+            if st.download_button(
                 "下载 Excel 数据包",
                 data=full_excel,
                 file_name="data_insight_export.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 type="primary",
                 key="report_full_excel",
-            )
+            ):
+                _track_report_export_click_success(
+                    "excel",
+                    full_excel,
+                    current_dataset=current_analysis_dataset,
+                    duration_ms=export_duration_ms,
+                    has_quality_summary=bool(report_quality_summary),
+                    has_charts=isinstance(report_business_result, pd.DataFrame)
+                    and not report_business_result.empty,
+                )
         except Exception as exc:
+            _track_report_export_failure_once(
+                "excel",
+                exc,
+                current_dataset=current_analysis_dataset,
+            )
             st.error(f"Excel 报告生成失败：{exc}")
 
         st.markdown("### Excel Dashboard 报告")
@@ -5940,57 +6135,104 @@ with delivery_tabs[0]:
             "系统已自动选择最匹配的字段；如识别不准确，可在下载前手动调整。"
         )
         try:
+            export_started_at = time.perf_counter()
             dashboard_excel = build_generated_dashboard_export(
                 df,
                 dashboard_field_config,
             )
-            st.download_button(
+            export_duration_ms = round((time.perf_counter() - export_started_at) * 1000, 2)
+            if st.download_button(
                 "下载 Excel Dashboard 报告",
                 data=dashboard_excel,
                 file_name="data_insight_dashboard.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="report_dashboard_excel",
-            )
+            ):
+                _track_report_export_click_success(
+                    "excel",
+                    dashboard_excel,
+                    current_dataset=current_analysis_dataset,
+                    duration_ms=export_duration_ms,
+                    has_quality_summary=False,
+                    has_charts=True,
+                )
         except Exception as exc:
+            _track_report_export_failure_once(
+                "excel",
+                exc,
+                current_dataset=current_analysis_dataset,
+            )
             st.error(f"Excel Dashboard 生成失败：{exc}")
 
     with report_tabs[1]:
         st.markdown("### 下载 Word 分析报告")
         st.caption("自动替换上传的 Word 模板占位符；未上传 Word 模板时使用系统默认报告结构。")
         try:
+            export_started_at = time.perf_counter()
             word_report = build_word_template_export(
                 df,
                 word_template_source,
                 report_template_context,
             )
-            st.download_button(
+            export_duration_ms = round((time.perf_counter() - export_started_at) * 1000, 2)
+            if st.download_button(
                 "下载 Word 分析报告",
                 data=word_report,
                 file_name="data_insight_report.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 key="report_word",
-            )
+            ):
+                _track_report_export_click_success(
+                    "word",
+                    word_report,
+                    current_dataset=current_analysis_dataset,
+                    duration_ms=export_duration_ms,
+                    has_quality_summary=bool(report_quality_summary),
+                    has_charts=isinstance(report_business_result, pd.DataFrame)
+                    and not report_business_result.empty,
+                )
         except Exception as exc:
+            _track_report_export_failure_once(
+                "word",
+                exc,
+                current_dataset=current_analysis_dataset,
+            )
             st.error(f"Word 报告生成失败：{exc}")
 
     with report_tabs[2]:
         st.markdown("### 下载 PPT 汇报材料")
         st.info("自动替换上传的 PPT 模板占位符；未上传 PPT 模板时使用系统默认六页汇报结构。")
         try:
+            export_started_at = time.perf_counter()
             ppt_report = build_ppt_template_export(
                 df,
                 ppt_template_source,
                 report_template_context,
             )
-            st.download_button(
+            export_duration_ms = round((time.perf_counter() - export_started_at) * 1000, 2)
+            if st.download_button(
                 "下载 PPT 汇报材料",
                 data=ppt_report,
                 file_name="data_insight_presentation.pptx",
                 mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
                 type="primary",
                 key="report_ppt",
-            )
+            ):
+                _track_report_export_click_success(
+                    "ppt",
+                    ppt_report,
+                    current_dataset=current_analysis_dataset,
+                    duration_ms=export_duration_ms,
+                    has_quality_summary=bool(report_quality_summary),
+                    has_charts=isinstance(report_business_result, pd.DataFrame)
+                    and not report_business_result.empty,
+                )
         except Exception as exc:
+            _track_report_export_failure_once(
+                "ppt",
+                exc,
+                current_dataset=current_analysis_dataset,
+            )
             st.error(f"PPT 报告生成失败：{exc}")
 
     with report_tabs[3]:
@@ -6025,7 +6267,24 @@ with delivery_tabs[0]:
                 type="primary",
                 key="generate_periodic_report",
             ):
+                periodic_export_type = {
+                    "周报": "weekly_report",
+                    "月报": "monthly_report",
+                    "季报": "quarterly_report",
+                    "年报": "yearly_report",
+                }.get(periodic_type, "unknown")
+                safe_track_event(
+                    "report_export_clicked",
+                    properties=report_export_properties(
+                        periodic_export_type,
+                        dataset=current_analysis_dataset,
+                        has_quality_summary=bool(report_quality_summary),
+                        has_charts=False,
+                    ),
+                    context=dataset_context(active_project_id, current_analysis_dataset),
+                )
                 try:
+                    export_started_at = time.perf_counter()
                     with st.spinner(f"AI 正在生成{periodic_type}..."):
                         st.session_state.ai_periodic_report = generate_ai_periodic_report(
                             df,
@@ -6036,7 +6295,31 @@ with delivery_tabs[0]:
                             model=ai_model,
                             base_url=ai_base_url,
                         )
+                    export_duration_ms = round((time.perf_counter() - export_started_at) * 1000, 2)
+                    safe_track_event(
+                        "report_export_success",
+                        properties=report_export_properties(
+                            periodic_export_type,
+                            dataset=current_analysis_dataset,
+                            file_size=len(str(st.session_state.ai_periodic_report).encode("utf-8")),
+                            has_quality_summary=bool(report_quality_summary),
+                            has_charts=False,
+                        ),
+                        context=dataset_context(active_project_id, current_analysis_dataset),
+                        duration_ms=export_duration_ms,
+                    )
                 except Exception as exc:
+                    safe_track_event(
+                        "report_export_failed",
+                        properties=report_export_properties(
+                            periodic_export_type,
+                            dataset=current_analysis_dataset,
+                            error_message=exc,
+                        ),
+                        context=dataset_context(active_project_id, current_analysis_dataset),
+                        success=False,
+                        error_type="export_error",
+                    )
                     st.error(f"AI 周期报告生成失败：{exc}")
             if st.session_state.get("ai_periodic_report"):
                 st.markdown(st.session_state.ai_periodic_report)
@@ -6052,7 +6335,18 @@ with delivery_tabs[0]:
             type="primary",
             key="generate_executive_summary",
         ):
+            safe_track_event(
+                "report_export_clicked",
+                properties=report_export_properties(
+                    "management_report",
+                    dataset=current_analysis_dataset,
+                    has_quality_summary=bool(report_quality_summary),
+                    has_charts=False,
+                ),
+                context=dataset_context(active_project_id, current_analysis_dataset),
+            )
             try:
+                export_started_at = time.perf_counter()
                 with st.spinner("AI 正在生成管理层摘要..."):
                     st.session_state.ai_executive_summary = request_management_summary(
                         report_business_summary,
@@ -6060,24 +6354,63 @@ with delivery_tabs[0]:
                         ai_model,
                         ai_base_url,
                     )
+                export_duration_ms = round((time.perf_counter() - export_started_at) * 1000, 2)
+                safe_track_event(
+                    "report_export_success",
+                    properties=report_export_properties(
+                        "management_report",
+                        dataset=current_analysis_dataset,
+                        file_size=len(str(st.session_state.ai_executive_summary).encode("utf-8")),
+                        has_quality_summary=bool(report_quality_summary),
+                        has_charts=False,
+                    ),
+                    context=dataset_context(active_project_id, current_analysis_dataset),
+                    duration_ms=export_duration_ms,
+                )
             except Exception as exc:
+                safe_track_event(
+                    "report_export_failed",
+                    properties=report_export_properties(
+                        "management_report",
+                        dataset=current_analysis_dataset,
+                        error_message=exc,
+                    ),
+                    context=dataset_context(active_project_id, current_analysis_dataset),
+                    success=False,
+                    error_type="export_error",
+                )
                 st.error(f"管理层摘要生成失败：{exc}")
         if st.session_state.get("ai_executive_summary"):
             st.markdown(st.session_state.ai_executive_summary)
         st.info("管理层汇报PPT为预览功能，当前生成文字版摘要与文字版PPT。")
         try:
+            export_started_at = time.perf_counter()
             executive_ppt = export_executive_ppt(
                 df,
                 calculate_kpi(df, business_fields),
                 st.session_state.get("ai_executive_summary") or report_ai_summary,
             )
-            st.download_button(
+            export_duration_ms = round((time.perf_counter() - export_started_at) * 1000, 2)
+            if st.download_button(
                 "导出管理层汇报PPT",
                 data=executive_ppt,
                 file_name="executive_briefing.pptx",
                 mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
                 type="primary",
                 key="report_executive_ppt",
-            )
+            ):
+                _track_report_export_click_success(
+                    "management_report",
+                    executive_ppt,
+                    current_dataset=current_analysis_dataset,
+                    duration_ms=export_duration_ms,
+                    has_quality_summary=bool(report_quality_summary),
+                    has_charts=True,
+                )
         except Exception as exc:
+            _track_report_export_failure_once(
+                "management_report",
+                exc,
+                current_dataset=current_analysis_dataset,
+            )
             st.error(f"管理层汇报 PPT 生成失败：{exc}")

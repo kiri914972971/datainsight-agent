@@ -69,3 +69,8 @@ pnpm-debug.log*
 .idea/
 .DS_Store
 Thumbs.db
+
+# Local analytics runtime logs
+workspace/analytics/*.jsonl
+workspace/analytics/*.log
+
