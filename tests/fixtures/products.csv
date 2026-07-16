@@ -1,0 +1,6 @@
+product_id,product_name,category,unit_price
+P001,产品A,标准类,50
+P002,产品B,标准类,60
+P003,产品C,增值类,80
+P004,产品D,增值类,100
+P005,产品E,试验类,120
