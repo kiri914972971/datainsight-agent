@@ -6,6 +6,15 @@ from src.services import analytics_service
 
 
 TrackEvent = Callable[..., dict[str, Any] | None]
+MAIN_FLOW_EVENTS = (
+    "dataset_uploaded",
+    "dataset_selected",
+    "data_quality_viewed",
+    "cleaned_dataset_generated",
+    "report_export_clicked",
+    "report_export_success",
+    "report_export_failed",
+)
 
 
 def safe_track_event(
@@ -191,6 +200,79 @@ def short_error_message(error: Any, limit: int = 120) -> str:
     """Return a short non-sensitive error summary for analytics properties."""
     text = str(error).replace("\n", " ").strip()
     return text[:limit]
+
+
+def summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Return aggregate counts for local analytics events."""
+    total = len(events)
+    success_count = sum(1 for event in events if event.get("success") is True)
+    failure_count = sum(1 for event in events if event.get("success") is False)
+    timestamps = [
+        str(event.get("timestamp"))
+        for event in events
+        if event.get("timestamp")
+    ]
+    return {
+        "total": total,
+        "success_count": success_count,
+        "failure_count": failure_count,
+        "success_rate": round(success_count / total * 100, 2) if total else 0.0,
+        "latest_timestamp": max(timestamps) if timestamps else None,
+    }
+
+
+def event_counts_by_name(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Count local analytics events by event_name."""
+    counts: dict[str, int] = {}
+    for event in events:
+        event_name = str(event.get("event_name") or "unknown")
+        counts[event_name] = counts.get(event_name, 0) + 1
+    return [
+        {"event_name": event_name, "count": count}
+        for event_name, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    ]
+
+
+def main_flow_funnel_rows(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return MVP main-flow event counts with short reader-facing labels."""
+    counts = {row["event_name"]: row["count"] for row in event_counts_by_name(events)}
+    descriptions = {
+        "dataset_uploaded": "数据上传成功或失败记录",
+        "dataset_selected": "当前分析数据集切换记录",
+        "data_quality_viewed": "数据质量中心渲染记录",
+        "cleaned_dataset_generated": "清洗数据集生成记录",
+        "report_export_clicked": "报告导出点击记录",
+        "report_export_success": "报告导出成功记录",
+        "report_export_failed": "报告导出失败记录",
+    }
+    return [
+        {
+            "事件": event_name,
+            "次数": counts.get(event_name, 0),
+            "说明": descriptions[event_name],
+        }
+        for event_name in MAIN_FLOW_EVENTS
+    ]
+
+
+def recent_events_table(events: list[dict[str, Any]], limit: int = 20) -> list[dict[str, Any]]:
+    """Return latest local events as compact table rows."""
+    recent = list(reversed(events))[: max(int(limit), 0)]
+    rows = []
+    for event in recent:
+        rows.append(
+            {
+                "timestamp": event.get("timestamp"),
+                "event_name": event.get("event_name"),
+                "success": event.get("success"),
+                "dataset_type": event.get("dataset_type")
+                or (event.get("properties") or {}).get("dataset_type"),
+                "project_id": event.get("project_id"),
+                "duration_ms": event.get("duration_ms"),
+                "error_type": event.get("error_type"),
+            }
+        )
+    return rows
 
 
 def _optional_int(value: Any) -> int | None:

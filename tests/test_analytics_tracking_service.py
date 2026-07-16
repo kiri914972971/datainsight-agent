@@ -4,7 +4,11 @@ from src.services.analytics_tracking_service import (
     cleaned_dataset_properties,
     dataset_context,
     dataset_properties,
+    event_counts_by_name,
+    main_flow_funnel_rows,
+    recent_events_table,
     safe_track_event,
+    summarize_events,
     track_event_once,
 )
 
@@ -95,6 +99,96 @@ class AnalyticsTrackingServiceTests(unittest.TestCase):
         self.assertEqual(properties["after_column_count"], 4)
         self.assertEqual(properties["missing_plan_step_count"], 2)
         self.assertTrue(properties["duplicate_plan_enabled"])
+
+    def test_summarize_events_returns_zero_summary_for_empty_list(self):
+        self.assertEqual(
+            summarize_events([]),
+            {
+                "total": 0,
+                "success_count": 0,
+                "failure_count": 0,
+                "success_rate": 0.0,
+                "latest_timestamp": None,
+            },
+        )
+
+    def test_summarize_events_returns_counts_and_success_rate(self):
+        summary = summarize_events(
+            [
+                {"event_name": "dataset_uploaded", "success": True, "timestamp": "2026-01-01T00:00:00Z"},
+                {"event_name": "report_export_failed", "success": False, "timestamp": "2026-01-02T00:00:00Z"},
+                {"event_name": "data_quality_viewed", "success": True, "timestamp": "2026-01-03T00:00:00Z"},
+            ]
+        )
+
+        self.assertEqual(summary["total"], 3)
+        self.assertEqual(summary["success_count"], 2)
+        self.assertEqual(summary["failure_count"], 1)
+        self.assertEqual(summary["success_rate"], 66.67)
+        self.assertEqual(summary["latest_timestamp"], "2026-01-03T00:00:00Z")
+
+    def test_event_counts_by_name_sorts_by_count_then_name(self):
+        rows = event_counts_by_name(
+            [
+                {"event_name": "dataset_selected"},
+                {"event_name": "dataset_uploaded"},
+                {"event_name": "dataset_selected"},
+            ]
+        )
+
+        self.assertEqual(
+            rows,
+            [
+                {"event_name": "dataset_selected", "count": 2},
+                {"event_name": "dataset_uploaded", "count": 1},
+            ],
+        )
+
+    def test_recent_events_table_returns_latest_events_first(self):
+        rows = recent_events_table(
+            [
+                {"timestamp": "1", "event_name": "old", "success": True},
+                {
+                    "timestamp": "2",
+                    "event_name": "new",
+                    "success": False,
+                    "dataset_type": "uploaded",
+                    "project_id": "project-1",
+                    "duration_ms": 12,
+                    "error_type": "export_error",
+                },
+            ],
+            limit=1,
+        )
+
+        self.assertEqual(
+            rows,
+            [
+                {
+                    "timestamp": "2",
+                    "event_name": "new",
+                    "success": False,
+                    "dataset_type": "uploaded",
+                    "project_id": "project-1",
+                    "duration_ms": 12,
+                    "error_type": "export_error",
+                }
+            ],
+        )
+
+    def test_main_flow_funnel_rows_include_known_mvp_events(self):
+        rows = main_flow_funnel_rows(
+            [
+                {"event_name": "dataset_uploaded"},
+                {"event_name": "dataset_uploaded"},
+                {"event_name": "report_export_success"},
+            ]
+        )
+        by_event = {row["事件"]: row for row in rows}
+
+        self.assertEqual(by_event["dataset_uploaded"]["次数"], 2)
+        self.assertEqual(by_event["report_export_success"]["次数"], 1)
+        self.assertEqual(by_event["report_export_failed"]["次数"], 0)
 
 
 if __name__ == "__main__":

@@ -176,14 +176,19 @@ from src.services.business_question_service import (
     load_question_parse_history,
     parse_question_for_project,
 )
+from src.services import analytics_service
 from src.services.analytics_tracking_service import (
     cleaned_dataset_properties,
     data_quality_properties,
     dataset_context,
     dataset_properties,
+    event_counts_by_name,
+    main_flow_funnel_rows,
     report_export_properties,
+    recent_events_table,
     safe_track_event,
     short_error_message,
+    summarize_events,
     track_event_once,
     upload_event_inputs,
 )
@@ -953,6 +958,125 @@ def _track_report_export_failure_once(
     )
     seen.add(fingerprint)
     st.session_state[seen_key] = sorted(seen)
+
+
+def render_analytics_viewer() -> None:
+    events = analytics_service.read_events(limit=None)
+    event_path = analytics_service.EVENT_LOG_PATH
+    st.caption(
+        "本地埋点日志仅用于开发调试和产品指标分析，默认记录聚合信息与操作事件，"
+        "不应记录原始数据行或敏感单元格值。"
+    )
+
+    control_columns = st.columns(2)
+    if control_columns[0].button("刷新事件日志", use_container_width=True, key="analytics_viewer_refresh"):
+        st.rerun()
+    confirm_clear = st.checkbox(
+        "我确认要清空本地事件日志",
+        key="analytics_viewer_confirm_clear",
+    )
+    if control_columns[1].button(
+        "清空本地事件日志",
+        disabled=not confirm_clear,
+        use_container_width=True,
+        key="analytics_viewer_clear",
+    ):
+        analytics_service.clear_events()
+        st.session_state.analytics_viewer_confirm_clear = False
+        st.success("本地事件日志已清空。")
+        st.rerun()
+
+    if event_path.is_file():
+        st.download_button(
+            "下载 events.jsonl",
+            data=event_path.read_bytes(),
+            file_name="events.jsonl",
+            mime="application/jsonl",
+            use_container_width=True,
+            key="analytics_viewer_download",
+        )
+
+    if not events:
+        st.info("当前还没有本地埋点事件。请先上传数据、进入数据质量或导出报告后再查看。")
+        return
+
+    summary = summarize_events(events)
+    summary_columns = st.columns(5)
+    summary_columns[0].metric("事件总数", summary["total"])
+    summary_columns[1].metric("成功事件数", summary["success_count"])
+    summary_columns[2].metric("失败事件数", summary["failure_count"])
+    summary_columns[3].metric("成功率", f"{summary['success_rate']:.2f}%")
+    summary_columns[4].metric("最近事件时间", summary["latest_timestamp"] or "-")
+
+    st.markdown("##### Event type distribution")
+    counts = event_counts_by_name(events)
+    if counts:
+        counts_df = pd.DataFrame(counts)
+        st.dataframe(counts_df, use_container_width=True, hide_index=True)
+        chart_df = counts_df.sort_values("count", ascending=True)
+        chart_height = max(260, min(680, 80 + len(chart_df) * 32))
+        event_type_chart = px.bar(
+            chart_df,
+            x="count",
+            y="event_name",
+            orientation="h",
+            labels={"count": "事件数", "event_name": "事件名称"},
+            height=chart_height,
+            text="count",
+        )
+        event_type_chart.update_layout(
+            margin={"l": 8, "r": 8, "t": 8, "b": 24},
+            yaxis={"automargin": True},
+            showlegend=False,
+        )
+        event_type_chart.update_traces(textposition="outside", cliponaxis=False)
+        st.plotly_chart(
+            event_type_chart,
+            use_container_width=True,
+            key="analytics_event_type_distribution",
+        )
+
+    st.markdown("##### Main-flow funnel summary")
+    st.dataframe(
+        pd.DataFrame(main_flow_funnel_rows(events)),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.markdown("##### Recent events")
+    st.dataframe(
+        pd.DataFrame(recent_events_table(events, limit=20)),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    with st.expander("查看最近事件原始 JSON", expanded=False):
+        st.json(list(reversed(events))[:20])
+
+
+def render_analytics_sidebar_summary() -> None:
+    events = analytics_service.read_events(limit=None)
+    summary = summarize_events(events)
+
+    st.caption(
+        "本地埋点日志仅用于开发调试和产品指标分析，不应记录原始数据行或敏感单元格值。"
+    )
+    st.metric("事件总数", summary["total"])
+    if summary["total"]:
+        st.metric("成功率", f"{summary['success_rate']:.2f}%")
+    else:
+        st.caption("成功率：-")
+    if summary["latest_timestamp"]:
+        st.caption(f"最近事件时间：{summary['latest_timestamp']}")
+    else:
+        st.caption("最近事件时间：-")
+    st.info("完整 Analytics Viewer 位于主页面底部的开发工具区域。")
+
+
+def render_main_analytics_viewer() -> None:
+    st.divider()
+    with st.expander("开发工具 / Analytics Viewer", expanded=False):
+        render_analytics_viewer()
 
 
 def _dataset_source_description(dataset: dict) -> str:
@@ -4571,11 +4695,16 @@ with st.sidebar:
     elif connection_status:
         st.info("AI 配置已更改，请重新测试连接。")
 
+    st.divider()
+    with st.expander("开发工具 / Analytics Viewer", expanded=False):
+        render_analytics_sidebar_summary()
+
 active_project = get_project(active_project_id)
 current_analysis_dataset = get_current_analysis_dataset(active_project_id)
 render_project_status_bar(active_project, current_analysis_dataset, len(project_data_files))
 if not current_analysis_dataset:
     render_project_setup_navigation(active_project_id)
+    render_main_analytics_viewer()
     st.stop()
 
 try:
@@ -6414,3 +6543,6 @@ with delivery_tabs[0]:
                 current_dataset=current_analysis_dataset,
             )
             st.error(f"管理层汇报 PPT 生成失败：{exc}")
+
+
+render_main_analytics_viewer()
