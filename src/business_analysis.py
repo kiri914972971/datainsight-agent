@@ -214,7 +214,11 @@ def generate_dimension_analysis(
     grouped = []
     for value, group in df.groupby(dimension, dropna=False):
         grouped.append({dimension: value, metric: calculate_business_metric(group, metric, fields)})
-    return pd.DataFrame(grouped).sort_values(metric, ascending=False, ignore_index=True)
+    return pd.DataFrame(grouped, columns=[dimension, metric]).sort_values(
+        metric,
+        ascending=False,
+        ignore_index=True,
+    )
 
 
 def generate_top_n(
@@ -222,9 +226,11 @@ def generate_top_n(
     dimension: str,
     metric: str,
     fields: dict,
-    top_n: int = 10,
+    top_n: int | None = 10,
 ) -> pd.DataFrame:
-    result = generate_dimension_analysis(df, dimension, metric, fields).head(top_n).copy()
+    result = generate_dimension_analysis(df, dimension, metric, fields)
+    if top_n is not None:
+        result = result.head(top_n).copy()
     result.insert(0, "排名", range(1, len(result) + 1))
     return result
 
@@ -248,10 +254,13 @@ def generate_dimension_trend(
     metric: str,
     fields: dict,
     period: str = "月报",
-    top_n: int = 5,
+    top_n: int | None = 5,
 ) -> pd.DataFrame:
-    top_values = generate_top_n(df, dimension, metric, fields, top_n)[dimension].tolist()
-    temp = df.loc[df[dimension].isin(top_values)].copy()
+    if top_n is None:
+        temp = df.copy()
+    else:
+        top_values = generate_top_n(df, dimension, metric, fields, top_n)[dimension].tolist()
+        temp = df.loc[df[dimension].isin(top_values)].copy()
     temp[date_column] = pd.to_datetime(temp[date_column], errors="coerce")
     temp = temp.dropna(subset=[date_column])
     temp["周期"] = temp[date_column].dt.to_period(PERIOD_RULES[period]).astype(str)
@@ -283,10 +292,73 @@ def parse_business_question(
     return _parse_business_question_rules(question, dimensions, metrics)
 
 
+def detect_multiple_business_questions(question: str) -> bool:
+    normalized = str(question or "").strip()
+    if not normalized:
+        return False
+
+    question_segments = [
+        segment.strip()
+        for segment in re.split(r"[?？]+", normalized)
+        if segment.strip()
+    ]
+    if len(question_segments) >= 2 and all(
+        _looks_like_business_analysis_clause(segment)
+        for segment in question_segments
+    ):
+        return True
+
+    semicolon_segments = [
+        segment.strip()
+        for segment in re.split(r"[;；]+", normalized)
+        if segment.strip()
+    ]
+    if len(semicolon_segments) >= 2 and all(
+        _looks_like_business_analysis_clause(segment)
+        for segment in semicolon_segments
+    ):
+        return True
+
+    for connector in ("同时", "另外", "以及", "并且", "还有"):
+        parts = [part.strip(" ，,") for part in normalized.split(connector, 1)]
+        if len(parts) == 2 and all(
+            _looks_like_business_analysis_clause(part) for part in parts
+        ):
+            return True
+
+    repeated_goal_parts = [
+        part.strip(" ，,")
+        for part in re.split(r"(?:，|,)\s*又", normalized, maxsplit=1)
+    ]
+    if len(repeated_goal_parts) == 2 and all(
+        _looks_like_business_analysis_clause(part) for part in repeated_goal_parts
+    ):
+        return True
+
+    if "分别" in normalized:
+        dimensions = set(
+            re.findall(
+                r"小组|销售人员|销售员|员工|工号|区域|地区|产品|客户|门店|渠道|部门|团队",
+                normalized,
+            )
+        )
+        metrics = set(
+            re.findall(
+                r"成交金额|销售额|订单数|客户数|客单价|利润|收入|增长率|增长",
+                normalized,
+            )
+        )
+        if len(dimensions) >= 2 or len(metrics) >= 2:
+            return True
+
+    return False
+
+
 def execute_business_query(df: pd.DataFrame, query: dict, fields: dict) -> pd.DataFrame:
     dimension = query.get("dimension")
     metric = query.get("metric")
-    limit = int(query.get("limit") or 5)
+    raw_limit = query.get("limit")
+    limit = int(raw_limit) if raw_limit is not None else None
     if dimension not in fields.get("dimensions", []):
         raise ValueError("未识别到可执行的业务分析维度。")
     if metric not in business_metric_options(fields):
@@ -303,7 +375,7 @@ def execute_business_query(df: pd.DataFrame, query: dict, fields: dict) -> pd.Da
             metric,
             fields,
             period="月报",
-            top_n=50,
+            top_n=None if limit is None else 50,
         )
         if trend.empty or trend["周期"].nunique() < 2:
             raise ValueError("当前数据不足以计算维度增长排名。")
@@ -316,7 +388,13 @@ def execute_business_query(df: pd.DataFrame, query: dict, fields: dict) -> pd.Da
             }
         )
         growth["增长率"] = (growth["最新值"] - growth["起始值"]) / growth["起始值"].abs().replace(0, pd.NA) * 100
-        growth = growth.dropna(subset=["增长率"]).sort_values("增长率", ascending=False).head(limit).reset_index(drop=True)
+        growth = growth.dropna(subset=["增长率"]).sort_values(
+            "增长率",
+            ascending=False,
+        )
+        if limit is not None:
+            growth = growth.head(limit)
+        growth = growth.reset_index(drop=True)
         growth.insert(0, "排名", range(1, len(growth) + 1))
         return growth
     return generate_top_n(filtered, dimension, metric, fields, limit)
@@ -352,6 +430,7 @@ def request_management_summary(
 
 要求：
 - 聚焦 KPI、同比、环比、趋势、Top 区域、Top 产品和 Top 人员。
+- 如输入包含“用户确认并保存的业务查询结果”，这些内容是用户主动保存的分析快照，不得重新计算或改写其中数值。
 - 不讨论均值、标准差、偏度、峰度、IQR、缺失值或异常值。
 - 不把共同变化直接解释为因果。
 - 每部分最多 4 点，内容简洁并完整结束。
@@ -391,8 +470,7 @@ def _parse_business_question_rules(question: str, dimensions: list[str], metrics
     metric = next((value for value in metrics if str(value).lower() in normalized), None)
     if metric is None:
         metric = next((value for value in ("成交金额", "客户数", "订单数", "客单价") if value in normalized), None)
-    limit_match = re.search(r"(?:top\s*|前|最高的?|排名前)\s*(\d+)", normalized)
-    limit = int(limit_match.group(1)) if limit_match else 5
+    limit = _extract_query_limit(normalized)
     recent_months = re.search(r"近\s*(\d+)\s*个?月", normalized)
     filters = [{"type": "recent_months", "value": int(recent_months.group(1))}] if recent_months else []
     return {
@@ -420,7 +498,16 @@ def _parse_business_question_ai(
 允许的指标：{json.dumps(metrics, ensure_ascii=False)}
 
 JSON 格式：
-{{"intent":"ranking","dimension":"","metric":"","aggregation":"sum","limit":5,"filters":[]}}
+{{"intent":"ranking","dimension":"","metric":"","aggregation":"sum","limit":null,"filters":[]}}
+
+limit 规则：
+- 用户明确指定 Top N、前 N、最高的 N 个或排名前 N 时，返回 1–50 的整数。
+- 用户未明确指定数量时，返回 null。
+- 不得因为问题中出现“最高”“最多”或“排名”等词而默认返回 5。
+
+示例：
+- “成交金额最高的前五个小组”中的 limit 为 5。
+- “各小组成交金额排名”中的 limit 为 null。
 
 业务问题：{question}
 """.strip()
@@ -431,14 +518,72 @@ JSON 格式：
     query = json.loads(match.group(0))
     if query.get("dimension") not in dimensions or query.get("metric") not in metrics:
         raise ValueError("AI 返回了未允许的维度或指标。")
+    raw_limit = query.get("limit")
+    limit = None if raw_limit is None else max(1, min(50, int(raw_limit)))
     return {
         "intent": str(query.get("intent") or "ranking"),
         "dimension": query["dimension"],
         "metric": query["metric"],
         "aggregation": str(query.get("aggregation") or "sum"),
-        "limit": max(1, min(50, int(query.get("limit") or 5))),
+        "limit": limit,
         "filters": query.get("filters") if isinstance(query.get("filters"), list) else [],
     }
+
+
+def _extract_query_limit(question: str) -> int | None:
+    match = re.search(
+        r"(?:top\s*|前|(?:最高|最多)的?\s*前?|排名\s*前)\s*"
+        r"(\d+|[一二三四五六七八九十两]+)\s*个?",
+        question,
+        flags=re.I,
+    )
+    if not match:
+        return None
+    value = match.group(1)
+    if value.isdigit():
+        return int(value)
+    return _parse_chinese_number(value)
+
+
+def _parse_chinese_number(value: str) -> int | None:
+    digits = {
+        "一": 1,
+        "二": 2,
+        "两": 2,
+        "三": 3,
+        "四": 4,
+        "五": 5,
+        "六": 6,
+        "七": 7,
+        "八": 8,
+        "九": 9,
+    }
+    if value in digits:
+        return digits[value]
+    if value == "十":
+        return 10
+    if "十" in value:
+        tens_text, ones_text = value.split("十", 1)
+        tens = digits.get(tens_text, 1) if tens_text else 1
+        ones = digits.get(ones_text, 0) if ones_text else 0
+        return tens * 10 + ones
+    return None
+
+
+def _looks_like_business_analysis_clause(value: str) -> bool:
+    has_metric = bool(
+        re.search(
+            r"成交金额|销售额|订单数|客户数|客单价|利润|收入|增长率|增长",
+            value,
+        )
+    )
+    has_analysis_intent = bool(
+        re.search(
+            r"最高|最多|最少|排名|分析|趋势|对比|哪些|哪个|谁|是多少|表现",
+            value,
+        )
+    )
+    return has_metric and has_analysis_intent
 
 
 def _find_column(columns, hints: tuple[str, ...]) -> str | None:

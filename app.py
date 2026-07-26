@@ -17,6 +17,7 @@ from src.ai_presets import AI_MODEL_PRESETS
 from src.business_analysis import (
     business_metric_options,
     calculate_kpi,
+    detect_multiple_business_questions,
     execute_business_query,
     filter_time_slice,
     generate_business_explanation,
@@ -27,6 +28,15 @@ from src.business_analysis import (
     identify_business_fields,
     parse_business_question,
     request_management_summary,
+)
+from src.business_query_history_service import (
+    build_saved_business_query_report_context,
+    dataframe_from_saved_query,
+    delete_saved_query,
+    get_saved_query,
+    get_saved_queries_for_dataset,
+    load_saved_queries,
+    save_query,
 )
 from src.cleaner import clean_data, comparison
 from src.data_loader import basic_info, load_data
@@ -50,6 +60,8 @@ required_exporter_attributes = {
     "export_ppt_from_template",
     "export_processed_data_excel",
     "export_word_from_template",
+    "format_saved_business_queries_text",
+    "build_saved_business_queries_ai_context",
     "generate_ai_periodic_report",
 }
 if not all(hasattr(exporter_module, name) for name in required_exporter_attributes):
@@ -61,6 +73,8 @@ export_full_excel_report = exporter_module.export_full_excel_report
 export_ppt_from_template = exporter_module.export_ppt_from_template
 export_processed_data_excel = exporter_module.export_processed_data_excel
 export_word_from_template = exporter_module.export_word_from_template
+format_saved_business_queries_text = exporter_module.format_saved_business_queries_text
+build_saved_business_queries_ai_context = exporter_module.build_saved_business_queries_ai_context
 generate_ai_periodic_report = exporter_module.generate_ai_periodic_report
 from src.data_quality import (
     apply_missing_value_fix,
@@ -424,6 +438,15 @@ def reset_for_dataframe(
         st.session_state.business_query_plan = None
         st.session_state.business_query_result = None
         st.session_state.business_query_explanation = None
+        st.session_state.business_query_question = None
+        st.session_state.business_query_dataset_key = None
+        st.session_state.business_query_dataset_name = None
+        st.session_state.current_business_query_saved_id = None
+        st.session_state.selected_saved_business_query_id = None
+        st.session_state.viewed_saved_business_query_id = None
+        st.session_state.pending_delete_business_query_id = None
+        st.session_state.business_query_history_project_id = None
+        st.session_state.business_query_history_message = None
         st.session_state.last_outlier_comparison = None
         st.session_state.last_outlier_before_df = None
         st.session_state.last_outlier_after_df = None
@@ -452,6 +475,10 @@ def set_current_data(after: pd.DataFrame, before: pd.DataFrame | None = None) ->
     st.session_state.business_query_plan = None
     st.session_state.business_query_result = None
     st.session_state.business_query_explanation = None
+    st.session_state.business_query_question = None
+    st.session_state.business_query_dataset_key = None
+    st.session_state.business_query_dataset_name = None
+    st.session_state.current_business_query_saved_id = None
 
 
 def clear_active_analysis() -> None:
@@ -471,6 +498,15 @@ def clear_active_analysis() -> None:
         "business_query_plan",
         "business_query_result",
         "business_query_explanation",
+        "business_query_question",
+        "business_query_dataset_key",
+        "business_query_dataset_name",
+        "current_business_query_saved_id",
+        "selected_saved_business_query_id",
+        "viewed_saved_business_query_id",
+        "pending_delete_business_query_id",
+        "business_query_history_project_id",
+        "business_query_history_message",
         "last_outlier_comparison",
         "last_outlier_before_df",
         "last_outlier_after_df",
@@ -4529,6 +4565,105 @@ def _format_file_size(file_size: int) -> str:
     return f"{file_size / 1024**2:.2f} MB"
 
 
+def _format_identifier_value(value: object) -> str:
+    if pd.isna(value):
+        return ""
+    if pd.api.types.is_integer(value):
+        return str(int(value))
+    if pd.api.types.is_float(value):
+        numeric_value = float(value)
+        if numeric_value.is_integer():
+            return f"{numeric_value:.0f}"
+        return f"{numeric_value:f}".rstrip("0").rstrip(".")
+    return str(value)
+
+
+def _prepare_business_query_result_for_display(
+    result: pd.DataFrame,
+    plan: dict,
+    identifier_columns: list[str],
+    *,
+    is_identifier_dimension: bool | None = None,
+) -> tuple[pd.DataFrame, bool]:
+    dimension = str(plan.get("dimension") or "")
+    resolved_identifier_dimension = (
+        dimension in identifier_columns
+        if is_identifier_dimension is None
+        else bool(is_identifier_dimension)
+    )
+    display_result = result.copy()
+    if dimension in display_result.columns:
+        if resolved_identifier_dimension:
+            display_result[dimension] = display_result[dimension].map(
+                _format_identifier_value
+            )
+        else:
+            display_result[dimension] = display_result[dimension].map(
+                lambda value: "" if pd.isna(value) else str(value)
+            )
+    return display_result, resolved_identifier_dimension
+
+
+def render_business_query_result(
+    result: pd.DataFrame,
+    plan: dict,
+    identifier_columns: list[str],
+    *,
+    chart_key: str,
+    is_identifier_dimension: bool | None = None,
+) -> pd.DataFrame:
+    display_result, resolved_identifier_dimension = (
+        _prepare_business_query_result_for_display(
+            result,
+            plan,
+            identifier_columns,
+            is_identifier_dimension=is_identifier_dimension,
+        )
+    )
+    if display_result.empty:
+        st.info("当前条件下没有查询结果")
+        return display_result
+
+    dimension = str(plan.get("dimension") or "")
+    metric = str(plan.get("metric") or "")
+    result_metric = "增长率" if "增长率" in display_result.columns else metric
+    st.dataframe(display_result, use_container_width=True, hide_index=True)
+    if resolved_identifier_dimension:
+        st.caption("当前分析维度为标识符字段，结果以排名表格展示。")
+    elif dimension in display_result.columns and result_metric in display_result.columns:
+        chart_title = (
+            f"{metric} Top {plan['limit']} {dimension}"
+            if plan.get("limit") is not None
+            else f"{metric} {dimension}排名"
+        )
+        st.plotly_chart(
+            px.bar(
+                display_result,
+                x=dimension,
+                y=result_metric,
+                title=chart_title,
+            ),
+            use_container_width=True,
+            key=chart_key,
+        )
+    return display_result
+
+
+def _format_saved_business_query_time(value: object) -> str:
+    timestamp = pd.to_datetime(value, errors="coerce", utc=True)
+    if pd.isna(timestamp):
+        return "-"
+    return timestamp.tz_convert("Asia/Shanghai").strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _saved_business_query_option_label(record: dict) -> str:
+    saved_time = _format_saved_business_query_time(record.get("saved_at"))
+    question = str(record.get("question") or "-").strip()
+    if len(question) > 60:
+        question = f"{question[:57]}..."
+    return f"[{saved_time}] {question}"
+
+
 def render_project_setup_navigation(project_id: str) -> None:
     def render_requires_dataset_notice() -> None:
         st.info(NO_CURRENT_ANALYSIS_DATASET_MESSAGE)
@@ -4555,14 +4690,12 @@ def render_project_setup_navigation(project_id: str) -> None:
         with metric_tabs[0]:
             render_requires_dataset_notice()
     with setup_groups[3]:
-        analysis_tabs = st.tabs(["业务问题", "探索性分析", "Dashboard", "业务分析"])
+        analysis_tabs = st.tabs(["探索性分析", "Dashboard", "业务分析"])
         with analysis_tabs[0]:
             render_requires_dataset_notice()
         with analysis_tabs[1]:
             render_requires_dataset_notice()
         with analysis_tabs[2]:
-            render_requires_dataset_notice()
-        with analysis_tabs[3]:
             render_requires_dataset_notice()
     with setup_groups[4]:
         delivery_tabs = st.tabs(["报告导出"])
@@ -4823,7 +4956,7 @@ with workflow_tabs[2]:
     metric_config_tabs = st.tabs(["指标中心"])
 
 with workflow_tabs[3]:
-    workbench_tabs = st.tabs(["业务问题", "探索性分析", "Dashboard", "业务分析"])
+    workbench_tabs = st.tabs(["探索性分析", "Dashboard", "业务分析"])
 
 with workflow_tabs[4]:
     delivery_tabs = st.tabs(["报告导出"])
@@ -4848,9 +4981,6 @@ with modeling_tabs[2]:
 
 with metric_config_tabs[0]:
     render_metric_center_tab(active_project_id, df)
-
-with workbench_tabs[0]:
-    render_business_question_tab(active_project_id)
 
 if False:
     render_module_intro(
@@ -5260,7 +5390,7 @@ if False:
     except Exception as exc:
         st.error(f"处理后数据导出失败：{exc}")
 
-with workbench_tabs[1]:
+with workbench_tabs[0]:
     render_module_intro(
         "chart",
         "Exploration",
@@ -5426,18 +5556,16 @@ with workbench_tabs[1]:
         if st.session_state.get("ai_exploration_result"):
             st.markdown(st.session_state.ai_exploration_result)
 
-with workbench_tabs[2]:
+with workbench_tabs[1]:
     render_dashboard_tab(active_project_id)
 
-with workbench_tabs[3]:
+with workbench_tabs[2]:
     render_module_intro(
         "layout-dashboard",
         "Business intelligence",
         "业务分析",
         "围绕经营指标、时间趋势、维度贡献和业务问题生成可直接支持决策的分析结果。",
     )
-    render_rule_based_business_analysis(active_project_id)
-    st.divider()
     business_tabs = st.tabs(["报表仪表盘", "维度对比分析", "业务问答"])
     business_fields = identify_business_fields(
         df,
@@ -5668,50 +5796,292 @@ with workbench_tabs[3]:
     with business_tabs[2]:
         st.subheader("业务问答")
         st.caption("系统只执行结构化分组查询，不生成或执行 AI 代码。")
+        if st.session_state.get("business_query_history_project_id") != active_project_id:
+            st.session_state.business_query_history_project_id = active_project_id
+            st.session_state.current_business_query_saved_id = None
+            st.session_state.selected_saved_business_query_id = None
+            st.session_state.viewed_saved_business_query_id = None
+            st.session_state.pending_delete_business_query_id = None
+            st.session_state.business_query_history_message = None
+
+        history_message = st.session_state.pop(
+            "business_query_history_message",
+            None,
+        )
+        if history_message:
+            if history_message.get("type") == "success":
+                st.success(history_message.get("message", ""))
+            else:
+                st.warning(history_message.get("message", ""))
+
         business_question = st.text_input(
             "请输入业务问题",
             placeholder="例如：成交金额最高的5个销售人员是谁",
             key="business_question",
         )
+        st.caption(
+            "每次仅支持分析一个业务问题。查询完成后，可点击‘保存结果’将其保存在当前项目中。"
+        )
         if st.button("分析业务问题", disabled=not business_question):
-            try:
-                plan = parse_business_question(
-                    business_question,
-                    business_dimensions,
-                    business_metrics,
-                    api_key or None,
-                    ai_model,
-                    ai_base_url,
+            if detect_multiple_business_questions(business_question):
+                st.warning(
+                    "检测到当前输入可能包含多个业务问题。当前每次仅支持分析一个问题，请拆分后分别提交。"
                 )
-                result = execute_business_query(df, plan, business_fields)
-                st.session_state.business_query_plan = plan
-                st.session_state.business_query_result = result
-                st.session_state.business_query_explanation = generate_business_explanation(
-                    result,
-                    plan["dimension"],
-                    plan["metric"],
-                )
-            except Exception as exc:
-                st.error(f"业务问题分析失败：{exc}")
+            else:
+                try:
+                    plan = parse_business_question(
+                        business_question,
+                        business_dimensions,
+                        business_metrics,
+                        api_key or None,
+                        ai_model,
+                        ai_base_url,
+                    )
+                    result = execute_business_query(df, plan, business_fields)
+                    st.session_state.business_query_question = business_question
+                    st.session_state.business_query_plan = plan
+                    st.session_state.business_query_result = result
+                    st.session_state.business_query_explanation = (
+                        generate_business_explanation(
+                            result,
+                            plan["dimension"],
+                            plan["metric"],
+                        )
+                    )
+                    st.session_state.business_query_dataset_key = str(
+                        current_analysis_dataset.get("dataset_id")
+                        or current_analysis_dataset.get("file_path")
+                        or current_analysis_dataset.get("dataset_name")
+                        or ""
+                    )
+                    st.session_state.business_query_dataset_name = str(
+                        current_analysis_dataset.get("dataset_name") or "-"
+                    )
+                    st.session_state.current_business_query_saved_id = None
+                except Exception as exc:
+                    st.error(f"业务问题分析失败：{exc}")
+
         if st.session_state.get("business_query_plan"):
             st.markdown("#### 结构化查询")
             st.json(st.session_state.business_query_plan)
             result = st.session_state.business_query_result
             plan = st.session_state.business_query_plan
-            result_metric = "增长率" if "增长率" in result.columns else plan["metric"]
             st.markdown("#### 查询结果")
-            st.dataframe(result, use_container_width=True, hide_index=True)
-            st.plotly_chart(
-                px.bar(
-                    result,
-                    x=plan["dimension"],
-                    y=result_metric,
-                    title=f"{plan['metric']} Top {plan['limit']} {plan['dimension']}",
-                ),
-                use_container_width=True,
-                key="business_question_chart",
+            display_result = render_business_query_result(
+                result,
+                plan,
+                identifier_columns,
+                chart_key="business_question_chart",
             )
             st.info(st.session_state.business_query_explanation)
+
+            if not display_result.empty:
+                st.caption(
+                    "未保存的查询结果仅在当前会话中保留，不会用于后续报告导出。"
+                )
+                saved_record_id = st.session_state.get(
+                    "current_business_query_saved_id"
+                )
+                if saved_record_id:
+                    st.button(
+                        "已保存",
+                        disabled=True,
+                        key="current_business_query_already_saved",
+                    )
+                elif st.button(
+                    "保存结果",
+                    type="primary",
+                    key="save_current_business_query",
+                ):
+                    try:
+                        saved_record = save_query(
+                            active_project_id,
+                            st.session_state.get("business_query_question")
+                            or business_question,
+                            plan,
+                            display_result,
+                            st.session_state.business_query_explanation,
+                            st.session_state.get("business_query_dataset_key")
+                            or str(
+                                current_analysis_dataset.get("dataset_id")
+                                or current_analysis_dataset.get("file_path")
+                                or ""
+                            ),
+                            st.session_state.get("business_query_dataset_name")
+                            or str(current_analysis_dataset.get("dataset_name") or "-"),
+                            is_identifier_dimension=(
+                                str(plan.get("dimension") or "")
+                                in identifier_columns
+                            ),
+                        )
+                        st.session_state.current_business_query_saved_id = (
+                            saved_record["id"]
+                        )
+                        st.session_state.business_query_history_message = {
+                            "type": "success",
+                            "message": "查询结果已保存到当前项目。",
+                        }
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"查询结果保存失败：{exc}")
+
+        st.markdown("#### 已保存查询")
+        saved_queries = sorted(
+            load_saved_queries(active_project_id),
+            key=lambda record: str(record.get("saved_at") or ""),
+            reverse=True,
+        )
+        if not saved_queries:
+            st.info("当前项目还没有已保存的业务查询。")
+        else:
+            summary_rows = []
+            for record in saved_queries:
+                query_plan = (
+                    record.get("query_plan")
+                    if isinstance(record.get("query_plan"), dict)
+                    else {}
+                )
+                summary_rows.append(
+                    {
+                        "保存时间": _format_saved_business_query_time(
+                            record.get("saved_at")
+                        ),
+                        "业务问题": record.get("question") or "-",
+                        "指标": query_plan.get("metric") or "-",
+                        "维度": query_plan.get("dimension") or "-",
+                        "结果行数": int(record.get("result_row_count") or 0),
+                        "数据集": record.get("dataset_name") or "-",
+                    }
+                )
+            st.dataframe(
+                pd.DataFrame(summary_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            record_by_id = {
+                record["id"]: record
+                for record in saved_queries
+                if record.get("id")
+            }
+            record_ids = list(record_by_id)
+            selector_key = f"saved_business_query_selector_{active_project_id}"
+            if st.session_state.get(selector_key) not in record_ids:
+                st.session_state[selector_key] = record_ids[0]
+            selected_record_id = st.selectbox(
+                "选择已保存查询",
+                record_ids,
+                format_func=lambda record_id: _saved_business_query_option_label(
+                    record_by_id[record_id]
+                ),
+                key=selector_key,
+            )
+            st.session_state.selected_saved_business_query_id = selected_record_id
+
+            history_actions = st.columns(2)
+            if history_actions[0].button(
+                "查看结果",
+                key="view_saved_business_query",
+                use_container_width=True,
+            ):
+                st.session_state.viewed_saved_business_query_id = selected_record_id
+                st.session_state.pending_delete_business_query_id = None
+            if history_actions[1].button(
+                "删除记录",
+                key="delete_saved_business_query",
+                use_container_width=True,
+            ):
+                st.session_state.pending_delete_business_query_id = selected_record_id
+
+            pending_delete_id = st.session_state.get(
+                "pending_delete_business_query_id"
+            )
+            if pending_delete_id:
+                st.warning(
+                    "确定要删除这条已保存查询吗？删除后不会用于后续报告导出。"
+                )
+                confirmation_columns = st.columns(2)
+                if confirmation_columns[0].button(
+                    "确认删除",
+                    type="primary",
+                    key=f"confirm_delete_business_query_{pending_delete_id}",
+                    use_container_width=True,
+                ):
+                    deleted = delete_saved_query(
+                        active_project_id,
+                        pending_delete_id,
+                    )
+                    if (
+                        st.session_state.get("viewed_saved_business_query_id")
+                        == pending_delete_id
+                    ):
+                        st.session_state.viewed_saved_business_query_id = None
+                    if (
+                        st.session_state.get("current_business_query_saved_id")
+                        == pending_delete_id
+                    ):
+                        st.session_state.current_business_query_saved_id = None
+                    st.session_state.selected_saved_business_query_id = None
+                    st.session_state.pending_delete_business_query_id = None
+                    st.session_state.business_query_history_message = {
+                        "type": "success" if deleted else "warning",
+                        "message": (
+                            "查询记录已删除。"
+                            if deleted
+                            else "未找到这条查询记录，可能已被删除。"
+                        ),
+                    }
+                    st.rerun()
+                if confirmation_columns[1].button(
+                    "取消",
+                    key=f"cancel_delete_business_query_{pending_delete_id}",
+                    use_container_width=True,
+                ):
+                    st.session_state.pending_delete_business_query_id = None
+                    st.rerun()
+
+            viewed_record_id = st.session_state.get(
+                "viewed_saved_business_query_id"
+            )
+            if viewed_record_id:
+                viewed_record = get_saved_query(
+                    active_project_id,
+                    viewed_record_id,
+                )
+                if viewed_record is None:
+                    st.warning("未找到这条查询记录，可能已被删除。")
+                else:
+                    viewed_plan = (
+                        viewed_record.get("query_plan")
+                        if isinstance(viewed_record.get("query_plan"), dict)
+                        else {}
+                    )
+                    viewed_result = dataframe_from_saved_query(viewed_record)
+                    st.markdown("##### 历史查询结果")
+                    st.markdown(
+                        f"**原始业务问题：** {viewed_record.get('question') or '-'}"
+                    )
+                    st.caption(
+                        "保存时间："
+                        f"{_format_saved_business_query_time(viewed_record.get('saved_at'))}"
+                    )
+                    st.caption(
+                        f"数据集：{viewed_record.get('dataset_name') or '-'}"
+                    )
+                    st.markdown("###### 结构化查询")
+                    st.json(viewed_plan)
+                    st.markdown("###### 保存时的查询结果")
+                    render_business_query_result(
+                        viewed_result,
+                        viewed_plan,
+                        identifier_columns,
+                        chart_key=f"saved_business_query_chart_{viewed_record_id}",
+                        is_identifier_dimension=viewed_record.get(
+                            "is_identifier_dimension"
+                        ),
+                    )
+                    st.markdown("###### 保存时的业务解读")
+                    st.info(viewed_record.get("explanation") or "暂无业务解读。")
 
 if False:
     st.subheader("数据清洗中心")
@@ -5994,6 +6364,26 @@ if False:
 with delivery_tabs[0]:
     st.subheader("报告导出中心")
     st.caption("将当前处理后的数据与分析结果整理为 Excel、Word、PPT 和 AI周期报告。所有导出均基于 current_df，不会覆盖 original_df。")
+    st.caption(
+        "报告仅使用当前数据集下已保存的业务查询结果。临时查询和其他数据集的查询不会进入报告。"
+    )
+    current_report_dataset_key = str(
+        current_analysis_dataset.get("dataset_id")
+        or current_analysis_dataset.get("file_path")
+        or current_analysis_dataset.get("dataset_name")
+        or ""
+    )
+    saved_business_query_records = get_saved_queries_for_dataset(
+        active_project_id,
+        current_report_dataset_key,
+    )
+    saved_business_queries = build_saved_business_query_report_context(
+        saved_business_query_records
+    )
+    if not saved_business_queries:
+        st.info(
+            "当前数据集暂无已保存业务查询。报告仍可生成，但不会包含业务问答结果。"
+        )
     word_template_source = None
     ppt_template_source = None
     st.markdown("### 报告模板设置")
@@ -6078,18 +6468,15 @@ with delivery_tabs[0]:
 
     report_numeric_summary = summarize_numeric_columns(df, eda_numeric_columns)
     report_categorical_summary = summarize_categorical_columns(df, eda_category_columns)
-    report_business_result = st.session_state.get("business_query_result")
-    if not isinstance(report_business_result, pd.DataFrame) or report_business_result.empty:
-        if business_dimensions and business_metrics:
-            report_business_result = generate_top_n(
-                df,
-                business_dimensions[0],
-                business_metrics[0],
-                business_fields,
-                10,
-            )
-        else:
-            report_business_result = None
+    report_saved_business_queries_text = format_saved_business_queries_text(
+        saved_business_queries
+    )
+    report_saved_business_queries_ai_context = (
+        build_saved_business_queries_ai_context(
+            saved_business_queries,
+            max_rows=20,
+        )
+    )
     report_quality_summary = dict(quality_summary)
     if "repair_suggestions" in globals():
         if isinstance(repair_suggestions, pd.DataFrame):
@@ -6109,10 +6496,9 @@ with delivery_tabs[0]:
     report_business_summary = {
         "核心 KPI": calculate_kpi(df, business_fields),
         "时间趋势": report_trend or "尚未生成",
-        "维度对比 / Top N": (
-            report_business_result.head(10).to_dict("records")
-            if isinstance(report_business_result, pd.DataFrame) and not report_business_result.empty
-            else "尚未生成"
+        "用户确认并保存的业务查询结果": (
+            report_saved_business_queries_ai_context
+            or "当前数据集没有用户保存的业务查询结果。"
         ),
         "字段映射优先项": mapping_business_summary(df, saved_field_mappings),
     }
@@ -6131,7 +6517,8 @@ with delivery_tabs[0]:
         "business_summary": report_business_summary,
         "kpi_summary": calculate_kpi(df, business_fields),
         "trend_summary": report_trend,
-        "topn_summary": report_business_result,
+        "topn_summary": report_saved_business_queries_text,
+        "saved_business_queries": saved_business_queries,
         "ai_insights": report_ai_summary,
         "risks": report_ai_summary,
         "recommendations": report_ai_summary,
@@ -6147,7 +6534,7 @@ with delivery_tabs[0]:
                 report_quality_summary,
                 report_numeric_summary,
                 report_categorical_summary,
-                report_business_result,
+                saved_business_queries,
             )
             export_duration_ms = round((time.perf_counter() - export_started_at) * 1000, 2)
             if st.download_button(
@@ -6164,8 +6551,7 @@ with delivery_tabs[0]:
                     current_dataset=current_analysis_dataset,
                     duration_ms=export_duration_ms,
                     has_quality_summary=bool(report_quality_summary),
-                    has_charts=isinstance(report_business_result, pd.DataFrame)
-                    and not report_business_result.empty,
+                    has_charts=False,
                 )
         except Exception as exc:
             _track_report_export_failure_once(
@@ -6317,8 +6703,7 @@ with delivery_tabs[0]:
                     current_dataset=current_analysis_dataset,
                     duration_ms=export_duration_ms,
                     has_quality_summary=bool(report_quality_summary),
-                    has_charts=isinstance(report_business_result, pd.DataFrame)
-                    and not report_business_result.empty,
+                    has_charts=False,
                 )
         except Exception as exc:
             _track_report_export_failure_once(
@@ -6353,8 +6738,7 @@ with delivery_tabs[0]:
                     current_dataset=current_analysis_dataset,
                     duration_ms=export_duration_ms,
                     has_quality_summary=bool(report_quality_summary),
-                    has_charts=isinstance(report_business_result, pd.DataFrame)
-                    and not report_business_result.empty,
+                    has_charts=False,
                 )
         except Exception as exc:
             _track_report_export_failure_once(
@@ -6420,6 +6804,7 @@ with delivery_tabs[0]:
                             {"季报": "季度报告", "年报": "年度报告"}.get(periodic_type, periodic_type),
                             periodic_date,
                             periodic_metrics,
+                            saved_business_queries=saved_business_queries,
                             api_key=api_key,
                             model=ai_model,
                             base_url=ai_base_url,
@@ -6518,6 +6903,7 @@ with delivery_tabs[0]:
                 df,
                 calculate_kpi(df, business_fields),
                 st.session_state.get("ai_executive_summary") or report_ai_summary,
+                saved_business_queries,
             )
             export_duration_ms = round((time.perf_counter() - export_started_at) * 1000, 2)
             if st.download_button(

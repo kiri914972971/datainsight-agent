@@ -88,18 +88,25 @@ def export_full_excel_report(
     quality_summary: Any = None,
     numeric_summary: Any = None,
     categorical_summary: Any = None,
-    business_result: Any = None,
+    saved_business_queries: list[dict] | None = None,
 ) -> bytes:
-    """Export the full V1 Excel workbook, skipping unavailable results."""
-    return _export_excel_sheets(
-        [
-            ("Processed Data", current_df),
-            ("Data Quality Summary", quality_summary),
-            ("Numeric Summary", numeric_summary),
-            ("Categorical Summary", categorical_summary),
-            ("Business Analysis Result", business_result),
-        ]
-    )
+    """Export the full workbook using only persisted business-query snapshots."""
+    queries = list(saved_business_queries or [])
+    sheets: list[tuple[str, Any]] = [
+        ("Processed Data", current_df),
+        ("Data Quality Summary", quality_summary),
+        ("Numeric Summary", numeric_summary),
+        ("Categorical Summary", categorical_summary),
+        ("Saved Business Queries", _saved_business_query_summary_frame(queries)),
+    ]
+    for index, query in enumerate(queries, start=1):
+        sheets.append(
+            (
+                f"Query_{index:02d}",
+                _saved_business_query_excel_frame(query),
+            )
+        )
+    return _export_excel_sheets(sheets)
 
 
 def export_excel_dashboard_from_template(
@@ -292,6 +299,7 @@ def export_word_report(
     categorical_summary: Any = None,
     business_summary: Any = None,
     ai_summary: str | None = None,
+    saved_business_queries: list[dict] | None = None,
 ) -> bytes:
     document = Document()
     document.add_heading("DataInsight Agent 数据分析报告", 0)
@@ -318,6 +326,7 @@ def export_word_report(
 
     document.add_heading("4. 业务分析摘要", level=1)
     _add_content(document, business_summary)
+    _append_saved_business_queries_to_word(document, saved_business_queries)
 
     document.add_heading("5. AI总结", level=1)
     document.add_paragraph(ai_summary or "尚未生成 AI 总结。")
@@ -335,11 +344,13 @@ def export_word_from_template(
 ) -> bytes:
     """Generate a Word report by replacing stable placeholders in a template."""
     replacements = _build_report_template_context(current_df, context)
+    saved_business_queries = list((context or {}).get("saved_business_queries") or [])
     if template_file is None:
         document = _build_default_word_report(replacements)
     else:
         document = Document(_binary_template_source(template_file))
         _replace_word_document_placeholders(document, replacements)
+    _append_saved_business_queries_to_word(document, saved_business_queries)
 
     buffer = BytesIO()
     document.save(buffer)
@@ -351,6 +362,7 @@ def export_ppt_report(
     quality_summary: Any = None,
     business_summary: Any = None,
     ai_summary: str | None = None,
+    saved_business_queries: list[dict] | None = None,
 ) -> bytes:
     """Generate the V2 text-first seven-slide presentation."""
     Presentation, Inches, Pt = _pptx_dependencies()
@@ -382,6 +394,11 @@ def export_ppt_report(
         _text_lines(ai_summary, limit=10) or ["尚未生成 AI 总结。"],
         Pt,
     )
+    _append_saved_business_queries_to_ppt(
+        presentation,
+        saved_business_queries,
+        Pt,
+    )
     return _save_presentation(presentation)
 
 
@@ -393,12 +410,19 @@ def export_ppt_from_template(
 ) -> bytes:
     """Generate a PowerPoint report by replacing placeholders in slide text."""
     replacements = _build_report_template_context(current_df, context)
+    saved_business_queries = list((context or {}).get("saved_business_queries") or [])
     Presentation, Inches, Pt = _pptx_dependencies()
     if template_file is None:
         presentation = _build_default_ppt_report(replacements, Presentation, Inches, Pt)
     else:
         presentation = Presentation(_binary_template_source(template_file))
         _replace_ppt_placeholders(presentation, replacements)
+
+    _append_saved_business_queries_to_ppt(
+        presentation,
+        saved_business_queries,
+        Pt,
+    )
 
     result = _save_presentation(presentation)
     return _finalize_binary_export(result, output_path)
@@ -411,6 +435,7 @@ def generate_ai_periodic_report(
     metric_columns: list[str],
     ai_client=None,
     *,
+    saved_business_queries: list[dict] | None = None,
     api_key: str | None = None,
     model: str = "gpt-5.4-mini",
     base_url: str = "https://api.openai.com/v1",
@@ -432,6 +457,16 @@ def generate_ai_periodic_report(
     if periodic.empty:
         raise ValueError("当前日期字段没有可用于生成周期报告的有效数据。")
 
+    saved_query_context = build_saved_business_queries_ai_context(
+        saved_business_queries,
+        max_rows=20,
+    )
+    saved_query_prompt = (
+        json.dumps(saved_query_context, ensure_ascii=False, default=str)
+        if saved_query_context
+        else "当前数据集没有用户保存的业务查询结果。"
+    )
+
     prompt = f"""
 你是一名经营分析顾问。根据下面的周期指标数据，用简体中文生成{period_type}。
 
@@ -446,9 +481,13 @@ def generate_ai_periodic_report(
 - 聚焦业务变化、风险和行动建议，不讨论缺失值、偏度、峰度或 IQR。
 - 不虚构数据中不存在的原因；信息不足时明确提出需要验证的问题。
 - 内容简洁，必须完整结束。
+- 下方业务查询结果均为用户确认并保存的分析快照，不得重新计算或改写其中数值。
 
 周期指标数据：
 {json.dumps(periodic.to_dict("records"), ensure_ascii=False, default=str)}
+
+用户确认并保存的业务查询结果：
+{saved_query_prompt}
 """.strip()
     if ai_client is not None:
         return ai_client(prompt)
@@ -461,6 +500,7 @@ def export_executive_ppt(
     current_df: pd.DataFrame,
     kpi_summary: Any = None,
     ai_summary: str | None = None,
+    saved_business_queries: list[dict] | None = None,
 ) -> bytes:
     """Generate the V4 five-slide management presentation."""
     Presentation, Inches, Pt = _pptx_dependencies()
@@ -475,7 +515,194 @@ def export_executive_ppt(
     _add_ppt_bullets(presentation, "核心 KPI", kpi_lines or ["暂无核心 KPI 结果。"], Pt)
     _add_ppt_bullets(presentation, "增长亮点与主要风险", ai_lines[5:9] or ["请先生成 AI 业务总结。"], Pt)
     _add_ppt_bullets(presentation, "行动建议", ai_lines[9:12] or ["建议结合业务分析结果制定行动计划。"], Pt)
+    _append_saved_business_queries_to_ppt(
+        presentation,
+        saved_business_queries,
+        Pt,
+    )
     return _save_presentation(presentation)
+
+
+def format_saved_business_queries_text(
+    saved_business_queries: list[dict] | None,
+    *,
+    max_result_rows: int = 20,
+) -> str:
+    queries = list(saved_business_queries or [])
+    if not queries:
+        return "当前分析数据集暂无已保存业务查询结果。"
+    sections = []
+    for index, query in enumerate(queries, start=1):
+        result_df = _saved_business_query_result_dataframe(query)
+        result_lines = _content_lines(result_df, limit=max_result_rows)
+        sections.append(
+            "\n".join(
+                [
+                    f"业务问题 {index}",
+                    f"问题：{query.get('question') or '-'}",
+                    f"指标：{query.get('metric') or '-'}",
+                    f"维度：{query.get('dimension') or '-'}",
+                    "查询结果：",
+                    *(result_lines or ["暂无查询结果。"]),
+                    f"分析解读：{query.get('explanation') or '-'}",
+                ]
+            )
+        )
+    return "\n\n".join(sections)
+
+
+def build_saved_business_queries_ai_context(
+    saved_business_queries: list[dict] | None,
+    *,
+    max_rows: int = 20,
+) -> list[dict]:
+    context = []
+    for query in saved_business_queries or []:
+        result_df = _saved_business_query_result_dataframe(query)
+        context.append(
+            {
+                "question": str(query.get("question") or "-"),
+                "metric": str(query.get("metric") or "-"),
+                "dimension": str(query.get("dimension") or "-"),
+                "result_row_count": _saved_business_query_row_count(
+                    query,
+                    result_df,
+                ),
+                "result_rows": result_df.head(max_rows).fillna("").to_dict(
+                    "records"
+                ),
+                "explanation": str(query.get("explanation") or "-"),
+            }
+        )
+    return context
+
+
+def _saved_business_query_summary_frame(queries: list[dict]) -> pd.DataFrame:
+    if not queries:
+        return pd.DataFrame(
+            {"说明": ["当前数据集暂无已保存业务查询。"]}
+        )
+    return pd.DataFrame(
+        [
+            {
+                "保存时间": query.get("saved_at") or "-",
+                "业务问题": query.get("question") or "-",
+                "指标": query.get("metric") or "-",
+                "维度": query.get("dimension") or "-",
+                "结果行数": _saved_business_query_row_count(
+                    query,
+                    _saved_business_query_result_dataframe(query),
+                ),
+                "数据集": query.get("dataset_name") or "-",
+            }
+            for query in queries
+        ]
+    )
+
+
+def _saved_business_query_excel_frame(query: dict) -> pd.DataFrame:
+    result_df = _saved_business_query_result_dataframe(query).fillna("")
+    width = max(2, len(result_df.columns))
+    rows = [
+        ["业务问题", query.get("question") or "-"],
+        ["指标", query.get("metric") or "-"],
+        ["维度", query.get("dimension") or "-"],
+        ["文字解读", query.get("explanation") or "-"],
+        [],
+        ["查询结果"],
+    ]
+    if result_df.empty:
+        rows.append(["暂无查询结果。"])
+    else:
+        rows.append(list(result_df.columns))
+        rows.extend(result_df.itertuples(index=False, name=None))
+    normalized_rows = [list(row) + [""] * (width - len(row)) for row in rows]
+    return pd.DataFrame(
+        normalized_rows,
+        columns=[f"内容{index}" for index in range(1, width + 1)],
+    )
+
+
+def _saved_business_query_result_dataframe(query: dict) -> pd.DataFrame:
+    result_df = query.get("result_df")
+    if isinstance(result_df, pd.DataFrame):
+        return result_df.copy()
+    columns = query.get("result_columns")
+    rows = query.get("result_rows")
+    if not isinstance(columns, list):
+        columns = []
+    if not isinstance(rows, list):
+        rows = []
+    valid_rows = [row for row in rows if isinstance(row, dict)]
+    return pd.DataFrame(valid_rows, columns=columns or None)
+
+
+def _saved_business_query_row_count(
+    query: dict,
+    result_df: pd.DataFrame,
+) -> int:
+    try:
+        return int(query.get("result_row_count") or len(result_df))
+    except (TypeError, ValueError):
+        return len(result_df)
+
+
+def _append_saved_business_queries_to_word(
+    document: Document,
+    saved_business_queries: list[dict] | None,
+) -> None:
+    document.add_heading("已保存业务查询", level=1)
+    queries = list(saved_business_queries or [])
+    if not queries:
+        document.add_paragraph("当前分析数据集暂无已保存业务查询结果。")
+        return
+    for index, query in enumerate(queries, start=1):
+        document.add_heading(f"业务问题 {index}", level=2)
+        document.add_paragraph(f"问题：{query.get('question') or '-'}")
+        document.add_paragraph(f"指标：{query.get('metric') or '-'}")
+        document.add_paragraph(f"维度：{query.get('dimension') or '-'}")
+        result_df = _saved_business_query_result_dataframe(query)
+        if result_df.empty:
+            document.add_paragraph("查询结果：暂无查询结果。")
+        else:
+            document.add_paragraph("查询结果：")
+            _add_docx_table(document, result_df, max_rows=max(1, len(result_df)))
+        document.add_paragraph(
+            f"分析解读：{query.get('explanation') or '-'}"
+        )
+
+
+def _append_saved_business_queries_to_ppt(
+    presentation,
+    saved_business_queries: list[dict] | None,
+    Pt,
+) -> None:
+    queries = list(saved_business_queries or [])
+    if not queries:
+        _add_ppt_bullets(
+            presentation,
+            "业务分析",
+            ["当前数据集暂无已保存业务查询结果。"],
+            Pt,
+        )
+        return
+    for index, query in enumerate(queries, start=1):
+        result_lines = _content_lines(
+            _saved_business_query_result_dataframe(query),
+            limit=5,
+        )
+        _add_ppt_bullets(
+            presentation,
+            f"业务问题 {index}",
+            [
+                f"问题：{query.get('question') or '-'}",
+                f"指标：{query.get('metric') or '-'}",
+                f"维度：{query.get('dimension') or '-'}",
+                f"分析解读：{query.get('explanation') or '-'}",
+                *(result_lines or ["查询结果：暂无查询结果。"]),
+            ],
+            Pt,
+        )
 
 
 def _export_excel_sheets(sheets: list[tuple[str, Any]]) -> bytes:
