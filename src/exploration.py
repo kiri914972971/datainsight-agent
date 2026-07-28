@@ -1251,6 +1251,392 @@ def categorical_distribution_table(series: pd.Series, top_n: int) -> pd.DataFram
     )
 
 
+CORRELATION_METHODS = ("pearson", "spearman")
+CORRELATION_MIN_SAMPLE_SIZE = 5
+CORRELATION_NORMAL_SAMPLE_SIZE = 20
+CORRELATION_COMPLETE_THRESHOLD = 0.9999
+CORRELATION_HIGH_RELATIONSHIP_WARNING = (
+    "高相关可能来自字段计算关系、共同趋势、样本结构或极端值，不代表因果关系。"
+)
+CORRELATION_COMPLETE_RELATIONSHIP_WARNING = (
+    "字段对接近完全相关，可能存在重复字段、单位转换或直接计算关系，"
+    "请检查字段定义。"
+)
+
+
+def describe_correlation_strength(value):
+    """Return the display strength label for a correlation coefficient."""
+    absolute_value = abs(float(value))
+    if absolute_value < 0.3:
+        return "关系较弱"
+    if absolute_value < 0.5:
+        return "存在一定关系"
+    if absolute_value < 0.7:
+        return "中等关系"
+    return "较强关系"
+
+
+def build_correlation_relationship_analysis(
+    df,
+    selected_columns,
+    method="pearson",
+    threshold=0.5,
+):
+    """Build JSON-safe pairwise correlation matrices and relationship rows."""
+    normalized_method = _normalize_correlation_method(method)
+    normalized_threshold = _normalize_correlation_threshold(threshold)
+    selected = _unique_correlation_columns(selected_columns)
+    valid_columns, excluded_columns, validation_warnings = (
+        _validate_correlation_columns(df, selected)
+    )
+
+    correlation_rows = [
+        [None for _ in valid_columns]
+        for _ in valid_columns
+    ]
+    sample_size_rows = [
+        [None for _ in valid_columns]
+        for _ in valid_columns
+    ]
+    finite_by_column = {
+        column: clean_finite_numeric_values(df[column])
+        for column in valid_columns
+    }
+    for index, column in enumerate(valid_columns):
+        correlation_rows[index][index] = 1.0
+        sample_size_rows[index][index] = int(len(finite_by_column[column]))
+
+    all_pairs = []
+    warnings_list = list(validation_warnings)
+    for index, field_a in enumerate(valid_columns):
+        for field_b_index in range(index + 1, len(valid_columns)):
+            field_b = valid_columns[field_b_index]
+            pair_frame = _pairwise_finite_numeric_frame(
+                df,
+                field_a,
+                field_b,
+            )
+            sample_size = int(len(pair_frame))
+            sample_size_rows[index][field_b_index] = sample_size
+            sample_size_rows[field_b_index][index] = sample_size
+            if sample_size < CORRELATION_MIN_SAMPLE_SIZE:
+                warnings_list.append(
+                    f"{field_a} 与 {field_b} 的共同有效有限数值记录不足 "
+                    f"{CORRELATION_MIN_SAMPLE_SIZE} 条，未计算相关系数。"
+                )
+                continue
+
+            correlation = _calculate_pair_correlation(
+                pair_frame,
+                normalized_method,
+            )
+            if pd.isna(correlation) or not np.isfinite(correlation):
+                warnings_list.append(
+                    f"{field_a} 与 {field_b} 在共同有效样本中无法计算相关系数。"
+                )
+                continue
+
+            correlation_value = max(
+                -1.0,
+                min(1.0, float(correlation)),
+            )
+            correlation_rows[index][field_b_index] = correlation_value
+            correlation_rows[field_b_index][index] = correlation_value
+            pair_warning = (
+                CORRELATION_COMPLETE_RELATIONSHIP_WARNING
+                if abs(correlation_value)
+                >= CORRELATION_COMPLETE_THRESHOLD
+                else None
+            )
+            all_pairs.append(
+                {
+                    "field_a": str(field_a),
+                    "field_b": str(field_b),
+                    "correlation": correlation_value,
+                    "absolute_correlation": abs(correlation_value),
+                    "direction": _correlation_direction(
+                        correlation_value
+                    ),
+                    "strength": describe_correlation_strength(
+                        correlation_value
+                    ),
+                    "sample_size": sample_size,
+                    "sample_status": (
+                        "样本较少"
+                        if sample_size < CORRELATION_NORMAL_SAMPLE_SIZE
+                        else "正常"
+                    ),
+                    "warning": pair_warning,
+                }
+            )
+
+    all_pairs.sort(
+        key=lambda item: (
+            -item["absolute_correlation"],
+            item["field_a"],
+            item["field_b"],
+        )
+    )
+    pairs = [
+        dict(item)
+        for item in all_pairs
+        if item["absolute_correlation"] >= normalized_threshold
+    ]
+    if any(
+        item["absolute_correlation"] >= 0.7
+        for item in all_pairs
+    ):
+        warnings_list.append(CORRELATION_HIGH_RELATIONSHIP_WARNING)
+
+    if len(selected) < 2 or len(valid_columns) < 2:
+        status = "insufficient_columns"
+    elif not all_pairs:
+        status = "no_valid_pairs"
+    else:
+        status = "ok"
+    result = {
+        "status": status,
+        "method": normalized_method,
+        "threshold": normalized_threshold,
+        "selected_columns": [str(column) for column in selected],
+        "valid_columns": [str(column) for column in valid_columns],
+        "excluded_columns": [str(column) for column in excluded_columns],
+        "matrix": {
+            "columns": [str(column) for column in valid_columns],
+            "rows": correlation_rows,
+        },
+        "sample_size_matrix": {
+            "columns": [str(column) for column in valid_columns],
+            "rows": sample_size_rows,
+        },
+        "pairs": pairs,
+        "all_pairs": [dict(item) for item in all_pairs],
+        "warnings": warnings_list,
+    }
+    result["interpretation"] = (
+        generate_correlation_relationship_interpretation(result)
+    )
+    return result
+
+
+def generate_correlation_relationship_interpretation(analysis_result):
+    """Generate a neutral, non-causal summary of displayed relationships."""
+    threshold = float(analysis_result.get("threshold", 0.5))
+    pairs = analysis_result.get("pairs", [])
+    if not pairs:
+        return (
+            f"当前没有字段对达到 |r| ≥ {threshold:g} 的显示阈值。"
+            "可以调低阈值查看较弱关系。"
+        )
+
+    descriptions = []
+    for pair in pairs[:3]:
+        strength = pair["strength"].replace("关系", "")
+        direction = pair["direction"]
+        if direction == "无明显方向":
+            relationship = f"{pair['strength']}且无明显方向"
+        else:
+            relationship = f"{strength}{direction}关系"
+        descriptions.append(
+            f"{pair['field_a']}与{pair['field_b']}呈{relationship}"
+            f"（r={pair['correlation']:.2f}，"
+            f"N={pair['sample_size']:,}）"
+        )
+    return (
+        "；".join(descriptions)
+        + "。相关关系不代表因果，高相关也可能来自指标定义、"
+        "共同时间趋势或样本结构。"
+    )
+
+
+def build_correlation_scatter_data(
+    df,
+    field_x,
+    field_y,
+    method="pearson",
+    max_points=5000,
+    random_state=42,
+):
+    """Build deterministic scatter rows while correlating all valid records."""
+    normalized_method = _normalize_correlation_method(method)
+    try:
+        normalized_max_points = int(max_points)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("max_points 必须是正整数。") from exc
+    if normalized_max_points < 1:
+        raise ValueError("max_points 必须是正整数。")
+
+    base_result = {
+        "status": "invalid_fields",
+        "field_x": str(field_x),
+        "field_y": str(field_y),
+        "method": normalized_method,
+        "correlation": None,
+        "sample_size": 0,
+        "displayed_point_count": 0,
+        "is_sampled": False,
+        "rows": [],
+    }
+    if (
+        field_x == field_y
+        or field_x not in df.columns
+        or field_y not in df.columns
+        or not _is_supported_correlation_numeric(df[field_x])
+        or not _is_supported_correlation_numeric(df[field_y])
+    ):
+        return base_result
+
+    pair_frame = _pairwise_finite_numeric_frame(
+        df,
+        field_x,
+        field_y,
+    )
+    sample_size = int(len(pair_frame))
+    base_result["sample_size"] = sample_size
+    if sample_size < CORRELATION_MIN_SAMPLE_SIZE:
+        base_result["status"] = "insufficient_data"
+        return base_result
+
+    correlation = _calculate_pair_correlation(
+        pair_frame,
+        normalized_method,
+    )
+    if pd.isna(correlation) or not np.isfinite(correlation):
+        base_result["status"] = "insufficient_data"
+        return base_result
+
+    if sample_size > normalized_max_points:
+        display_frame = pair_frame.sample(
+            n=normalized_max_points,
+            random_state=random_state,
+        )
+        is_sampled = True
+    else:
+        display_frame = pair_frame
+        is_sampled = False
+    rows = [
+        {
+            "x": float(field_x_value),
+            "y": float(field_y_value),
+        }
+        for field_x_value, field_y_value in display_frame[
+            ["_field_a", "_field_b"]
+        ].itertuples(index=False, name=None)
+    ]
+    base_result.update(
+        {
+            "status": "ok",
+            "correlation": max(
+                -1.0,
+                min(1.0, float(correlation)),
+            ),
+            "displayed_point_count": int(len(rows)),
+            "is_sampled": is_sampled,
+            "rows": rows,
+        }
+    )
+    return base_result
+
+
+def _normalize_correlation_method(method):
+    normalized_method = str(method).lower()
+    if normalized_method not in CORRELATION_METHODS:
+        raise ValueError("method 仅支持 pearson 或 spearman。")
+    return normalized_method
+
+
+def _normalize_correlation_threshold(threshold):
+    try:
+        normalized_threshold = float(threshold)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("threshold 必须在 0 到 1 之间。") from exc
+    if (
+        not np.isfinite(normalized_threshold)
+        or not 0 <= normalized_threshold <= 1
+    ):
+        raise ValueError("threshold 必须在 0 到 1 之间。")
+    return normalized_threshold
+
+
+def _unique_correlation_columns(selected_columns):
+    selected = []
+    for column in selected_columns or []:
+        if column not in selected:
+            selected.append(column)
+    return selected
+
+
+def _validate_correlation_columns(df, selected_columns):
+    valid_columns = []
+    excluded_columns = []
+    warnings_list = []
+    for column in selected_columns:
+        reason = None
+        if column not in df.columns:
+            reason = "字段不存在"
+        elif not _is_supported_correlation_numeric(df[column]):
+            reason = "不是数值字段"
+        else:
+            finite_values = clean_finite_numeric_values(df[column])
+            if finite_values.empty:
+                reason = "没有有效有限数值"
+            elif finite_values.nunique(dropna=True) <= 1:
+                reason = "字段为常量"
+            elif len(finite_values) < CORRELATION_MIN_SAMPLE_SIZE:
+                reason = (
+                    f"有效有限数值不足 {CORRELATION_MIN_SAMPLE_SIZE} 条"
+                )
+        if reason is None:
+            valid_columns.append(column)
+        else:
+            excluded_columns.append(column)
+            warnings_list.append(f"{column}：{reason}，已排除。")
+    return valid_columns, excluded_columns, warnings_list
+
+
+def _is_supported_correlation_numeric(series):
+    return (
+        pd.api.types.is_numeric_dtype(series.dtype)
+        and not pd.api.types.is_bool_dtype(series.dtype)
+        and not pd.api.types.is_datetime64_any_dtype(series.dtype)
+    )
+
+
+def _pairwise_finite_numeric_frame(df, field_a, field_b):
+    field_a_values = pd.to_numeric(
+        df[field_a].copy(deep=True),
+        errors="coerce",
+    ).replace([np.inf, -np.inf], np.nan)
+    field_b_values = pd.to_numeric(
+        df[field_b].copy(deep=True),
+        errors="coerce",
+    ).replace([np.inf, -np.inf], np.nan)
+    return pd.DataFrame(
+        {
+            "_field_a": field_a_values,
+            "_field_b": field_b_values,
+        },
+        index=df.index,
+    ).dropna()
+
+
+def _calculate_pair_correlation(pair_frame, method):
+    field_a_values = pair_frame["_field_a"]
+    field_b_values = pair_frame["_field_b"]
+    if method == "spearman":
+        field_a_values = field_a_values.rank(method="average")
+        field_b_values = field_b_values.rank(method="average")
+    return field_a_values.corr(field_b_values, method="pearson")
+
+
+def _correlation_direction(value):
+    if value > 0:
+        return "正向"
+    if value < 0:
+        return "负向"
+    return "无明显方向"
+
+
 def calculate_correlation_pairs(df: pd.DataFrame, numeric_columns: list[str]) -> pd.DataFrame:
     if len(numeric_columns) < 2:
         return pd.DataFrame(columns=["字段A", "字段B", "相关系数", "相关强度", "可能含义"])
