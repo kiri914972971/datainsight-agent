@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import pandas as pd
 
@@ -183,6 +185,76 @@ def build_exploration_field_roles(
         "role_by_column": role_by_column,
         "columns_by_role": columns_by_role,
         "excluded_reasons": excluded_reasons,
+    }
+
+
+def build_exploration_overview(df, field_roles, dataset_name=None):
+    """Build a display-ready overview from unified exploration field roles."""
+    columns_by_role = field_roles.get("columns_by_role", {})
+    role_by_column = field_roles.get("role_by_column", {})
+    excluded_reasons = field_roles.get("excluded_reasons", {})
+
+    numeric_columns = list(columns_by_role.get("numeric", []))
+    categorical_columns = list(columns_by_role.get("categorical", []))
+    boolean_columns = list(columns_by_role.get("boolean", []))
+    datetime_columns = list(columns_by_role.get("datetime", []))
+    identifier_columns = list(columns_by_role.get("identifier", []))
+
+    datetime_summary = {
+        "mode": "none",
+        "column": None,
+        "start_date": None,
+        "end_date": None,
+        "column_count": len(datetime_columns),
+    }
+    if len(datetime_columns) == 1:
+        datetime_column = datetime_columns[0]
+        datetime_summary["mode"] = "single"
+        datetime_summary["column"] = datetime_column
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                parsed_dates = pd.to_datetime(
+                    df[datetime_column],
+                    errors="coerce",
+                ).dropna()
+            if not parsed_dates.empty:
+                datetime_summary["start_date"] = parsed_dates.min().strftime("%Y-%m-%d")
+                datetime_summary["end_date"] = parsed_dates.max().strftime("%Y-%m-%d")
+        except (KeyError, TypeError, ValueError, OverflowError):
+            pass
+    elif len(datetime_columns) > 1:
+        datetime_summary["mode"] = "multiple"
+
+    excluded_roles = {
+        "identifier",
+        "derived_time",
+        "constant",
+        "unsupported",
+    }
+    excluded_fields = []
+    for column in df.columns:
+        role = role_by_column.get(column)
+        if role not in excluded_roles:
+            continue
+        excluded_fields.append(
+            {
+                "column": column,
+                "role": role,
+                "reason": excluded_reasons.get(column, ""),
+            }
+        )
+
+    return {
+        "dataset_name": dataset_name or "当前分析数据集",
+        "row_count": len(df),
+        "column_count": len(df.columns),
+        "numeric_count": len(numeric_columns),
+        "categorical_count": len(categorical_columns) + len(boolean_columns),
+        "datetime_count": len(datetime_columns),
+        "identifier_count": len(identifier_columns),
+        "datetime_summary": datetime_summary,
+        "excluded_fields": excluded_fields,
     }
 
 

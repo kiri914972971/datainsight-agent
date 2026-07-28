@@ -90,6 +90,8 @@ from src.data_quality import (
     suspicious_columns,
 )
 from src.exploration import (
+    build_exploration_field_roles,
+    build_exploration_overview,
     calculate_correlation_pairs,
     categorical_distribution_table,
     categorical_profile,
@@ -5397,8 +5399,81 @@ with workbench_tabs[0]:
         "探索性分析",
         "从数值分布、类别结构与相关关系理解数据特征，所有统计均自动排除疑似 ID 字段。",
     )
-    st.caption("数据质量问题请前往「数据质量」tab 处理。疑似 ID 字段已从探索分析中排除。")
-    render_rule_based_eda_report(active_project_id)
+    try:
+        generate_eda_report(active_project_id)
+    except Exception as exc:
+        st.error(f"探索分析基础结果生成失败：{exc}")
+
+    try:
+        exploration_field_roles = build_exploration_field_roles(
+            df,
+            identifier_columns=identifier_columns,
+            datetime_columns=date_columns,
+            invalid_columns=invalid_columns,
+            confirmed_type_by_column=confirmed_type_by_column,
+        )
+        exploration_overview = build_exploration_overview(
+            df,
+            exploration_field_roles,
+            dataset_name=current_analysis_dataset.get("dataset_name"),
+        )
+    except Exception as exc:
+        st.error(f"探索概览生成失败：{exc}")
+    else:
+        st.subheader("探索概览")
+        st.markdown(f"**当前数据集名称：** {exploration_overview['dataset_name']}")
+        overview_columns = st.columns(6)
+        overview_columns[0].metric("数据行数", f"{exploration_overview['row_count']:,}")
+        overview_columns[1].metric("总字段数", exploration_overview["column_count"])
+        overview_columns[2].metric("可分析数值字段", exploration_overview["numeric_count"])
+        overview_columns[3].metric("可分析类别字段", exploration_overview["categorical_count"])
+        overview_columns[4].metric("日期字段", exploration_overview["datetime_count"])
+        overview_columns[5].metric("已排除标识符字段", exploration_overview["identifier_count"])
+
+        st.markdown("#### 时间范围")
+        datetime_summary = exploration_overview["datetime_summary"]
+        if datetime_summary["mode"] == "single":
+            time_columns = st.columns(3)
+            time_columns[0].metric("日期字段", datetime_summary["column"])
+            if datetime_summary["start_date"] and datetime_summary["end_date"]:
+                time_columns[1].metric("最早日期", datetime_summary["start_date"])
+                time_columns[2].metric("最晚日期", datetime_summary["end_date"])
+            else:
+                time_columns[1].metric("日期范围", "暂无有效日期范围")
+        elif datetime_summary["mode"] == "multiple":
+            st.caption(
+                f"检测到 {datetime_summary['column_count']} 个日期字段，"
+                "请在后续【时间分布】中选择需要分析的字段。"
+            )
+        else:
+            st.caption("当前数据集未检测到可用的完整日期字段。")
+
+        st.caption("探索性分析用于理解数据分布、类别构成、时间覆盖和字段关系，不会在此修改原始数据。")
+        st.caption(
+            "本模块中的‘记录数’基于当前分析数据集的行数。"
+            "若数据由多表合并生成，请结合表关系判断记录是否存在重复展开。"
+        )
+
+        with st.expander("查看已排除字段及原因", expanded=False):
+            excluded_fields = exploration_overview["excluded_fields"]
+            if excluded_fields:
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "字段": item["column"],
+                                "字段角色": item["role"],
+                                "排除原因": item["reason"],
+                            }
+                            for item in excluded_fields
+                        ]
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.caption("当前没有需要排除的字段。")
+
     st.divider()
     exploration_tabs = st.tabs(["数值分析", "类别分析", "相关分析", "AI 探索洞察"])
 
