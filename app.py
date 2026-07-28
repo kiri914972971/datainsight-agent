@@ -90,15 +90,17 @@ from src.data_quality import (
     suspicious_columns,
 )
 from src.exploration import (
+    build_categorical_composition_analysis,
+    build_categorical_top_n_chart_data,
     build_exploration_field_roles,
     build_exploration_overview,
     build_numeric_distribution_analysis,
+    calculate_dataframe_height,
     calculate_correlation_pairs,
-    categorical_distribution_table,
-    categorical_profile,
+    categorical_composition_table_title,
+    generate_categorical_composition_interpretation,
     get_analysis_categorical_columns,
     get_analysis_numeric_columns,
-    interpret_categorical_distribution,
     summarize_categorical_columns,
     summarize_numeric_columns,
 )
@@ -5498,7 +5500,7 @@ with workbench_tabs[0]:
                 st.caption("当前没有需要排除的字段。")
 
     st.divider()
-    exploration_tabs = st.tabs(["数值分布", "类别分析", "相关分析", "AI 探索洞察"])
+    exploration_tabs = st.tabs(["数值分布", "类别构成", "相关分析", "AI 探索洞察"])
 
     with exploration_tabs[0]:
         st.subheader("数值分布")
@@ -5716,68 +5718,288 @@ with workbench_tabs[0]:
                     )
 
     with exploration_tabs[1]:
-        st.subheader("类别分析")
-        if not eda_category_columns:
-            st.info("当前数据没有可用于类别分析的字段。")
+        st.subheader("类别构成")
+        st.caption(
+            "用于查看单个类别字段中各类别的记录数、记录数占比和长尾结构。"
+            "此处的记录分布不代表成交金额、销量或业务贡献。"
+        )
+        st.caption(
+            "本页面只做统计探索，不修改当前分析数据集，不执行数据清洗，"
+            "不产生经营风险判断，也不联动筛选其他页面。"
+        )
+        categorical_role_by_column = (
+            exploration_field_roles.get("role_by_column", {})
+            if exploration_field_roles
+            else {}
+        )
+        categorical_composition_columns = [
+            column
+            for column in df.columns
+            if categorical_role_by_column.get(column)
+            in {"categorical", "boolean"}
+        ]
+        if not categorical_composition_columns:
+            st.info("当前数据集没有可用于类别构成分析的字段。")
         else:
+            categorical_composition_dataset_key = str(
+                current_analysis_dataset.get("dataset_id")
+                or current_analysis_dataset.get("file_path")
+                or current_analysis_dataset.get("dataset_name")
+                or analysis_key
+            )
+            categorical_selector_key = _safe_streamlit_key(
+                "categorical_composition_field_"
+                f"{active_project_id}_{categorical_composition_dataset_key}"
+            )
+            if (
+                st.session_state.get(categorical_selector_key)
+                not in categorical_composition_columns
+            ):
+                st.session_state[categorical_selector_key] = (
+                    categorical_composition_columns[0]
+                )
             selected_category = st.selectbox(
                 "选择类别字段",
-                eda_category_columns,
-                key="exploration_category_column",
+                categorical_composition_columns,
+                key=categorical_selector_key,
             )
-            st.markdown("#### 类别字段总览")
-            st.dataframe(
-                summarize_categorical_columns(df, eda_category_columns),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            st.markdown(f"#### {selected_category} 类别画像")
-            selected_category_profile = categorical_profile(df[selected_category])
-            category_cards = st.columns(5)
-            category_cards[0].metric("唯一值数量", selected_category_profile["唯一值数量"])
-            category_cards[1].metric("Top 1 类别", str(selected_category_profile["Top 1 类别"]))
-            category_cards[2].metric("Top 1 占比", f"{selected_category_profile['Top 1 占比']:.2f}%")
-            category_cards[3].metric("Top 5 类别覆盖率", f"{selected_category_profile['Top 5 类别覆盖率']:.2f}%")
-            category_cards[4].metric("集中程度", selected_category_profile["集中程度"])
-            st.info(interpret_categorical_distribution(df[selected_category], selected_category))
-
-            unique_count = selected_category_profile["唯一值数量"]
-            if unique_count > 50:
-                st.warning("该字段唯一值过多，可能更像ID或自由文本，不建议直接做类别分布分析。")
-            if unique_count <= 1:
-                category_top_n = 1
-                st.caption("当前字段仅有一个有效类别。")
-            else:
-                category_top_n = st.slider(
-                    "Top N",
-                    min_value=1,
-                    max_value=min(30, unique_count),
-                    value=min(10, unique_count),
-                    key="exploration_category_top_n",
+            try:
+                categorical_composition = build_categorical_composition_analysis(
+                    df[selected_category],
+                    selected_category,
                 )
-            category_distribution = categorical_distribution_table(df[selected_category], category_top_n)
-            category_charts = st.columns(2)
-            category_charts[0].plotly_chart(
-                px.bar(
-                    category_distribution,
-                    x="类别",
-                    y="数量",
-                    title=f"{selected_category} Top {category_top_n} 类别",
-                ),
-                use_container_width=True,
-                key="exploration_category_bar",
-            )
-            category_charts[1].plotly_chart(
-                px.pie(
-                    category_distribution,
-                    names="类别",
-                    values="数量",
-                    title=f"{selected_category} Top {category_top_n} 占比",
-                ),
-                use_container_width=True,
-                key="exploration_category_pie",
-            )
+            except Exception as exc:
+                st.error(f"类别构成分析失败：{exc}")
+            else:
+                if categorical_composition["status"] == "no_valid_data":
+                    st.info("当前字段没有可用于类别构成分析的有效记录。")
+                else:
+                    if categorical_composition["excluded_count"] > 0:
+                        st.caption(
+                            f"本次类别构成基于 {categorical_composition['valid_count']:,} 条有效记录，"
+                            f"另有 {categorical_composition['excluded_count']:,} 条空值未参与。"
+                            "缺失值请前往【数据质量】查看。"
+                        )
+
+                    top1_category = str(
+                        categorical_composition["top1_category"]
+                    )
+                    top1_display = (
+                        top1_category
+                        if len(top1_category) <= 30
+                        else f"{top1_category[:27]}..."
+                    )
+                    st.markdown("#### 核心统计")
+                    category_cards = st.columns(5)
+                    category_cards[0].metric(
+                        "有效记录数",
+                        f"{categorical_composition['valid_count']:,}",
+                    )
+                    category_cards[1].metric(
+                        "类别数量",
+                        f"{categorical_composition['category_count']:,}",
+                    )
+                    category_cards[2].metric("Top 1 类别", top1_display)
+                    category_cards[3].metric(
+                        "Top 1 记录数占比",
+                        f"{categorical_composition['top1_ratio'] * 100:.2f}%",
+                    )
+                    category_cards[4].metric(
+                        "Top 5 累计记录数占比",
+                        f"{categorical_composition['top5_ratio'] * 100:.2f}%",
+                    )
+
+                    full_composition_table = pd.DataFrame(
+                        [
+                            {
+                                "排名": item["rank"],
+                                "类别": item["category"],
+                                "记录数": item["count"],
+                                "记录数占比": f"{item['ratio'] * 100:.2f}%",
+                                "累计记录数占比": (
+                                    f"{item['cumulative_ratio'] * 100:.2f}%"
+                                ),
+                            }
+                            for item in categorical_composition["rows"]
+                        ]
+                    )
+                    category_count = categorical_composition["category_count"]
+                    st.markdown(
+                        "#### "
+                        f"{categorical_composition_table_title(category_count)}"
+                    )
+                    if category_count > 5000:
+                        st.caption(
+                            f"该字段包含 {category_count:,} 个类别，属于高基数字段。"
+                            "页面仅展示记录数最高的 5,000 个类别，可下载完整统计结果。"
+                        )
+                        displayed_composition_table = (
+                            full_composition_table.head(5000)
+                        )
+                    else:
+                        displayed_composition_table = full_composition_table
+                    st.dataframe(
+                        displayed_composition_table,
+                        use_container_width=True,
+                        hide_index=True,
+                        height=calculate_dataframe_height(
+                            len(displayed_composition_table)
+                        ),
+                    )
+
+                    if category_count > 5000:
+                        st.download_button(
+                            "下载完整类别统计 CSV",
+                            data=full_composition_table.to_csv(
+                                index=False,
+                            ).encode("utf-8-sig"),
+                            file_name=_safe_csv_file_name(
+                                f"{selected_category}_类别构成.csv"
+                            ),
+                            mime="text/csv",
+                            key=_safe_streamlit_key(
+                                "categorical_composition_download_"
+                                f"{active_project_id}_"
+                                f"{categorical_composition_dataset_key}_"
+                                f"{selected_category}"
+                            ),
+                        )
+
+                    if (
+                        categorical_composition["valid_count"] > 0
+                        and category_count
+                        / categorical_composition["valid_count"]
+                        >= 0.9
+                    ):
+                        st.caption(
+                            "该字段的类别数量接近有效记录数，可能是未识别的标识符字段，"
+                            "请检查字段角色配置。"
+                        )
+
+                    if categorical_composition["status"] == "constant":
+                        st.info("该字段只有一个有效类别，无法形成类别构成比较。")
+                        st.markdown("#### 构成解读")
+                        st.write(categorical_composition["interpretation"])
+                    else:
+                        max_top_n = min(30, category_count)
+                        if max_top_n <= 5:
+                            category_top_n = category_count
+                        else:
+                            default_top_n = min(10, max_top_n)
+                            category_top_n_key = _safe_streamlit_key(
+                                "categorical_composition_top_n_"
+                                f"{active_project_id}_"
+                                f"{categorical_composition_dataset_key}_"
+                                f"{selected_category}"
+                            )
+                            current_top_n = st.session_state.get(
+                                category_top_n_key
+                            )
+                            if (
+                                not isinstance(current_top_n, int)
+                                or current_top_n < 5
+                                or current_top_n > max_top_n
+                            ):
+                                st.session_state[category_top_n_key] = (
+                                    default_top_n
+                                )
+                            category_top_n = st.slider(
+                                "Top N",
+                                min_value=5,
+                                max_value=max_top_n,
+                                value=default_top_n,
+                                key=category_top_n_key,
+                            )
+
+                        categorical_chart_data = (
+                            build_categorical_top_n_chart_data(
+                                categorical_composition,
+                                category_top_n,
+                            )
+                        )
+                        chart_rows = categorical_chart_data["chart_rows"]
+                        chart_frame = pd.DataFrame(
+                            {
+                                "类别": [
+                                    item["category"]
+                                    for item in chart_rows
+                                ],
+                                "记录数": [
+                                    item["count"]
+                                    for item in chart_rows
+                                ],
+                            }
+                        )
+                        chart_title = (
+                            f"{selected_category} Top {category_top_n} 记录数分布"
+                            if category_count > category_top_n
+                            else f"{selected_category} 记录数分布"
+                        )
+                        category_figure = px.bar(
+                            chart_frame,
+                            x="记录数",
+                            y="类别",
+                            orientation="h",
+                            title=chart_title,
+                        )
+                        category_figure.update_layout(
+                            yaxis={
+                                "categoryorder": "array",
+                                "categoryarray": list(
+                                    reversed(chart_frame["类别"].tolist())
+                                ),
+                                "automargin": True,
+                            },
+                            margin={"l": 180},
+                        )
+                        st.plotly_chart(
+                            category_figure,
+                            use_container_width=True,
+                            key=_safe_streamlit_key(
+                                "categorical_composition_chart_"
+                                f"{active_project_id}_"
+                                f"{categorical_composition_dataset_key}_"
+                                f"{selected_category}"
+                            ),
+                        )
+
+                        if categorical_chart_data["has_other"]:
+                            with st.expander(
+                                "查看‘其他’包含的类别",
+                                expanded=False,
+                            ):
+                                st.dataframe(
+                                    pd.DataFrame(
+                                        [
+                                            {
+                                                "类别": item["category"],
+                                                "记录数": item["count"],
+                                                "记录数占比": (
+                                                    f"{item['ratio'] * 100:.2f}%"
+                                                ),
+                                            }
+                                            for item in categorical_chart_data[
+                                                "other_rows"
+                                            ]
+                                        ]
+                                    ),
+                                    use_container_width=True,
+                                    hide_index=True,
+                                    height=400,
+                                )
+
+                        st.markdown("#### 构成解读")
+                        st.write(
+                            generate_categorical_composition_interpretation(
+                                selected_category,
+                                categorical_composition,
+                                categorical_chart_data,
+                            )
+                        )
+                    st.caption(
+                        "此处按当前分析数据集的记录数统计，不代表成交金额、"
+                        "销量或其他业务指标贡献。"
+                    )
 
     with exploration_tabs[2]:
         st.subheader("相关分析")

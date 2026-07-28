@@ -446,6 +446,225 @@ def _plain_number(value):
     return f"{number:,.6f}".rstrip("0").rstrip(".")
 
 
+def build_categorical_composition_analysis(series, field_name):
+    """Build complete, serializable category composition statistics."""
+    valid_values = series.loc[series.notna()].copy()
+    total_count = len(series)
+    valid_count = len(valid_values)
+    excluded_count = total_count - valid_count
+
+    if valid_count == 0:
+        return {
+            "status": "no_valid_data",
+            "field_name": str(field_name),
+            "total_count": int(total_count),
+            "valid_count": 0,
+            "excluded_count": int(excluded_count),
+            "category_count": 0,
+            "top1_category": None,
+            "top1_count": 0,
+            "top1_ratio": 0.0,
+            "top5_ratio": 0.0,
+            "low_frequency_count": 0,
+            "low_frequency_ratio": 0.0,
+            "rows": [],
+            "interpretation": "当前字段没有可用于类别构成分析的有效记录。",
+        }
+
+    counts = valid_values.value_counts(dropna=False, sort=False)
+    count_rows = [
+        {
+            "category": _categorical_display_value(category),
+            "count": int(count),
+            "_stable_value": (
+                _categorical_display_value(category).casefold(),
+                _categorical_display_value(category),
+                type(category).__name__,
+                repr(category),
+            ),
+        }
+        for category, count in counts.items()
+    ]
+    count_rows.sort(
+        key=lambda item: (
+            -item["count"],
+            item["_stable_value"],
+        )
+    )
+
+    cumulative_count = 0
+    rows = []
+    for rank, item in enumerate(count_rows, start=1):
+        cumulative_count += item["count"]
+        rows.append(
+            {
+                "rank": rank,
+                "category": item["category"],
+                "count": item["count"],
+                "ratio": float(item["count"] / valid_count),
+                "cumulative_ratio": float(cumulative_count / valid_count),
+            }
+        )
+
+    category_count = len(rows)
+    top1_row = rows[0]
+    top5_count = sum(item["count"] for item in rows[:5])
+    low_frequency_rows = [
+        item
+        for item in rows
+        if item["ratio"] < 0.01
+    ]
+    result = {
+        "status": "constant" if category_count == 1 else "ok",
+        "field_name": str(field_name),
+        "total_count": int(total_count),
+        "valid_count": int(valid_count),
+        "excluded_count": int(excluded_count),
+        "category_count": int(category_count),
+        "top1_category": top1_row["category"],
+        "top1_count": int(top1_row["count"]),
+        "top1_ratio": float(top1_row["ratio"]),
+        "top5_ratio": float(top5_count / valid_count),
+        "low_frequency_count": int(len(low_frequency_rows)),
+        "low_frequency_ratio": float(
+            sum(item["count"] for item in low_frequency_rows) / valid_count
+        ),
+        "rows": rows,
+    }
+    result["interpretation"] = generate_categorical_composition_interpretation(
+        field_name,
+        result,
+    )
+    return result
+
+
+def build_categorical_top_n_chart_data(analysis_result, top_n):
+    """Build Top N chart rows while keeping merged categories separate."""
+    all_rows = analysis_result.get("rows", [])
+    if not all_rows:
+        return {
+            "top_n": 0,
+            "top_rows": [],
+            "other_rows": [],
+            "chart_rows": [],
+            "has_other": False,
+        }
+
+    resolved_top_n = max(1, min(int(top_n), len(all_rows)))
+    top_rows = [dict(item) for item in all_rows[:resolved_top_n]]
+    other_rows = [dict(item) for item in all_rows[resolved_top_n:]]
+    chart_rows = [
+        {
+            "category": item["category"],
+            "count": int(item["count"]),
+            "ratio": float(item["ratio"]),
+            "is_merged_other": False,
+        }
+        for item in top_rows
+    ]
+    if other_rows:
+        other_count = sum(item["count"] for item in other_rows)
+        valid_count = max(int(analysis_result.get("valid_count", 0)), 1)
+        chart_rows.append(
+            {
+                "category": "其他（合并）",
+                "count": int(other_count),
+                "ratio": float(other_count / valid_count),
+                "is_merged_other": True,
+            }
+        )
+
+    return {
+        "top_n": resolved_top_n,
+        "top_rows": top_rows,
+        "other_rows": other_rows,
+        "chart_rows": chart_rows,
+        "has_other": bool(other_rows),
+    }
+
+
+def generate_categorical_composition_interpretation(
+    field_name,
+    composition_result,
+    chart_result=None,
+):
+    """Generate a deterministic description of record-count composition."""
+    status = composition_result.get("status")
+    if status == "no_valid_data":
+        return "当前字段没有可用于类别构成分析的有效记录。"
+    if status == "constant":
+        return "该字段只有一个有效类别，无法形成类别构成比较。"
+
+    top1_category = composition_result.get("top1_category", "")
+    top1_count = int(composition_result.get("top1_count", 0))
+    top1_ratio = float(composition_result.get("top1_ratio", 0.0))
+    category_count = int(composition_result.get("category_count", 0))
+    top5_ratio = float(composition_result.get("top5_ratio", 0.0))
+    descriptions = [
+        (
+            f"{field_name} 共包含 {category_count:,} 个类别。"
+            f"{top1_category} 包含 {top1_count:,} 条记录，"
+            f"占该字段有效记录的 {top1_ratio * 100:.2f}%。"
+        ),
+        f"Top 5 类别累计覆盖 {top5_ratio * 100:.2f}% 的有效记录。",
+    ]
+
+    low_frequency_count = int(
+        composition_result.get("low_frequency_count", 0)
+    )
+    if low_frequency_count > 0:
+        low_frequency_ratio = float(
+            composition_result.get("low_frequency_ratio", 0.0)
+        )
+        descriptions.append(
+            f"共有 {low_frequency_count:,} 个类别的记录数占比低于 1%，"
+            f"合计占比 {low_frequency_ratio * 100:.2f}%。"
+        )
+
+    if chart_result and chart_result.get("has_other"):
+        other_ratio = sum(
+            float(item.get("ratio", 0.0))
+            for item in chart_result.get("other_rows", [])
+        )
+        descriptions.append(
+            f"当前图表中的“其他（合并）”合计占比 {other_ratio * 100:.2f}%。"
+        )
+
+    descriptions.append("以上内容仅描述当前分析数据集中的记录分布。")
+    return "".join(descriptions)
+
+
+def _categorical_display_value(value):
+    return str(value)
+
+
+def calculate_dataframe_height(
+    row_count,
+    max_visible_rows=12,
+    row_height=35,
+    header_height=38,
+):
+    """Calculate a compact dataframe height with a bounded visible row count."""
+    resolved_row_count = max(int(row_count or 0), 0)
+    resolved_max_rows = max(int(max_visible_rows), 1)
+    resolved_row_height = max(int(row_height), 1)
+    resolved_header_height = max(int(header_height), 1)
+    visible_rows = min(max(resolved_row_count, 1), resolved_max_rows)
+    vertical_padding = 6
+    return (
+        resolved_header_height
+        + visible_rows * resolved_row_height
+        + vertical_padding
+    )
+
+
+def categorical_composition_table_title(category_count, display_limit=5000):
+    """Return a truthful title for complete or page-limited category tables."""
+    if int(category_count or 0) > int(display_limit):
+        return f"类别构成表（页面展示前 {int(display_limit):,} 类）"
+    return "完整类别构成表"
+
+
 def get_analysis_numeric_columns(df: pd.DataFrame, identifier_columns: list[str]) -> list[str]:
     identifiers = set(identifier_columns)
     return [
