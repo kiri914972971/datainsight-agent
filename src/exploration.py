@@ -4,6 +4,188 @@ import pandas as pd
 from src.outlier import detect_outliers_iqr
 
 
+EXPLORATION_FIELD_ROLES = (
+    "identifier",
+    "numeric",
+    "categorical",
+    "boolean",
+    "datetime",
+    "derived_time",
+    "constant",
+    "unsupported",
+)
+
+_CONFIRMED_TYPE_TO_ROLE = {
+    "identifier": "identifier",
+    "numeric": "numeric",
+    "categorical": "categorical",
+    "boolean": "boolean",
+    "datetime": "datetime",
+    "derived_time": "derived_time",
+    "constant": "constant",
+    "unsupported": "unsupported",
+    "ID字段": "identifier",
+    "日期字段": "datetime",
+    "时间字段": "datetime",
+    "金额字段": "numeric",
+    "数量字段": "numeric",
+    "产品字段": "categorical",
+    "区域字段": "categorical",
+    "人员字段": "categorical",
+    "类别字段": "categorical",
+    "布尔字段": "boolean",
+    "忽略字段": "unsupported",
+    "其他字段": "unsupported",
+}
+
+_DERIVED_TIME_EXACT_NAMES = {
+    "年",
+    "年份",
+    "year",
+    "月",
+    "月份",
+    "month",
+    "季度",
+    "quarter",
+    "星期",
+    "周几",
+    "weekday",
+    "week_day",
+}
+
+_DERIVED_TIME_CHINESE_SUFFIXES = (
+    "年份",
+    "月份",
+    "季度",
+    "星期",
+    "周几",
+    "年",
+    "月",
+)
+
+_DERIVED_TIME_ENGLISH_SUFFIXES = (
+    "year",
+    "month",
+    "quarter",
+    "weekday",
+    "week_day",
+)
+
+
+def is_derived_time_column(column_name, series):
+    """Return whether a column name conservatively describes a derived time field."""
+    del series
+
+    normalized_name = str(column_name).strip().lower()
+    if normalized_name in _DERIVED_TIME_EXACT_NAMES:
+        return True
+
+    if any(
+        normalized_name.endswith(suffix)
+        and len(normalized_name) > len(suffix)
+        for suffix in _DERIVED_TIME_CHINESE_SUFFIXES
+    ):
+        return True
+
+    tokenized_name = normalized_name.replace("-", "_").replace(" ", "_")
+    while "__" in tokenized_name:
+        tokenized_name = tokenized_name.replace("__", "_")
+
+    return any(
+        tokenized_name.endswith(f"_{suffix}")
+        for suffix in _DERIVED_TIME_ENGLISH_SUFFIXES
+    )
+
+
+def build_exploration_field_roles(
+    df,
+    identifier_columns=None,
+    datetime_columns=None,
+    invalid_columns=None,
+    confirmed_type_by_column=None,
+):
+    """Build one deterministic exploration role for every DataFrame column."""
+    identifier_columns = (
+        set(identifier_columns) if identifier_columns is not None else set()
+    )
+    datetime_columns = (
+        set(datetime_columns) if datetime_columns is not None else set()
+    )
+    invalid_columns = set(invalid_columns) if invalid_columns is not None else set()
+    confirmed_type_by_column = (
+        dict(confirmed_type_by_column)
+        if confirmed_type_by_column is not None
+        else {}
+    )
+
+    role_by_column = {}
+    columns_by_role = {role: [] for role in EXPLORATION_FIELD_ROLES}
+    excluded_reasons = {}
+
+    for column in df.columns:
+        series = df[column]
+        role = None
+        unsupported_reason = None
+
+        if column in invalid_columns:
+            role = "unsupported"
+            unsupported_reason = "无效字段"
+        else:
+            confirmed_type = confirmed_type_by_column.get(column)
+            confirmed_role = _CONFIRMED_TYPE_TO_ROLE.get(confirmed_type)
+            if confirmed_role is not None:
+                role = confirmed_role
+                if role == "unsupported":
+                    unsupported_reason = "人工确认排除字段"
+            elif column in identifier_columns:
+                role = "identifier"
+            elif column in datetime_columns or pd.api.types.is_datetime64_any_dtype(
+                series.dtype
+            ):
+                role = "datetime"
+            elif is_derived_time_column(column, series):
+                role = "derived_time"
+            elif series.nunique(dropna=True) == 1:
+                role = "constant"
+            elif pd.api.types.is_bool_dtype(series.dtype):
+                role = "boolean"
+            elif pd.api.types.is_numeric_dtype(series.dtype):
+                role = "numeric"
+            elif (
+                pd.api.types.is_object_dtype(series.dtype)
+                or isinstance(series.dtype, pd.CategoricalDtype)
+                or pd.api.types.is_string_dtype(series.dtype)
+            ):
+                if series.notna().any():
+                    role = "categorical"
+                else:
+                    role = "unsupported"
+                    unsupported_reason = "全部为空"
+            else:
+                role = "unsupported"
+                unsupported_reason = "暂不支持的数据类型"
+
+        role_by_column[column] = role
+        columns_by_role[role].append(column)
+
+        if role == "identifier":
+            excluded_reasons[column] = "标识符字段"
+        elif role == "datetime":
+            excluded_reasons[column] = "日期时间字段"
+        elif role == "derived_time":
+            excluded_reasons[column] = "时间派生字段"
+        elif role == "constant":
+            excluded_reasons[column] = "仅有一个有效值"
+        elif role == "unsupported":
+            excluded_reasons[column] = unsupported_reason or "暂不支持的数据类型"
+
+    return {
+        "role_by_column": role_by_column,
+        "columns_by_role": columns_by_role,
+        "excluded_reasons": excluded_reasons,
+    }
+
+
 def get_analysis_numeric_columns(df: pd.DataFrame, identifier_columns: list[str]) -> list[str]:
     identifiers = set(identifier_columns)
     return [
