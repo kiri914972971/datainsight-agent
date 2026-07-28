@@ -92,6 +92,7 @@ from src.data_quality import (
 from src.exploration import (
     build_categorical_composition_analysis,
     build_categorical_top_n_chart_data,
+    build_correlation_relationship_analysis,
     build_exploration_field_roles,
     build_exploration_overview,
     build_numeric_distribution_analysis,
@@ -5506,7 +5507,7 @@ with workbench_tabs[0]:
 
     st.divider()
     exploration_tabs = st.tabs(
-        ["数值分布", "类别构成", "时间分布", "相关分析", "AI 探索洞察"]
+        ["数值分布", "类别构成", "时间分布", "相关关系", "AI 探索洞察"]
     )
 
     with exploration_tabs[0]:
@@ -6305,19 +6306,348 @@ with workbench_tabs[0]:
                                 st.info("当前粒度没有可展示的时间分布数据。")
 
     with exploration_tabs[3]:
-        st.subheader("相关分析")
-        st.caption("相关性仅表示变量共同变化关系，不代表因果关系。")
-        if len(eda_numeric_columns) < 2:
-            st.info("当前可用于相关性分析的数值字段少于2个。")
-        else:
-            st.plotly_chart(
-                correlation_heatmap(df, eda_numeric_columns),
-                use_container_width=True,
-                key="eda_correlation",
+        st.subheader("相关关系")
+        st.caption(
+            "用于查看数值字段之间的同步变化关系。"
+            "相关关系不代表因果，高相关也可能来自指标定义、"
+            "共同时间趋势、样本结构或极端值。"
+        )
+        st.caption(
+            "年份、月份、标识符和其他不适合计算相关系数的字段已自动排除。"
+        )
+        correlation_numeric_columns = (
+            list(
+                exploration_field_roles.get("columns_by_role", {}).get(
+                    "numeric",
+                    [],
+                )
             )
-            st.markdown("#### 高相关字段对")
-            correlation_pairs = calculate_correlation_pairs(df, eda_numeric_columns)
-            st.dataframe(correlation_pairs, use_container_width=True, hide_index=True)
+            if exploration_field_roles
+            else []
+        )
+        if len(correlation_numeric_columns) < 2:
+            st.info("当前数据集没有足够的数值字段进行相关关系分析。")
+        else:
+            correlation_dataset_key = str(
+                current_analysis_dataset.get("dataset_id")
+                or current_analysis_dataset.get("file_path")
+                or current_analysis_dataset.get("dataset_name")
+                or analysis_key
+            )
+            correlation_field_key = _safe_streamlit_key(
+                "correlation_relationship_fields_"
+                f"{active_project_id}_{correlation_dataset_key}"
+            )
+            existing_correlation_fields = st.session_state.get(
+                correlation_field_key
+            )
+            if existing_correlation_fields is not None:
+                cleaned_correlation_fields = [
+                    column
+                    for column in existing_correlation_fields
+                    if column in correlation_numeric_columns
+                ]
+                if cleaned_correlation_fields != list(
+                    existing_correlation_fields
+                ):
+                    st.session_state[correlation_field_key] = (
+                        cleaned_correlation_fields
+                    )
+            selected_correlation_columns = st.multiselect(
+                "选择参与分析的数值字段",
+                correlation_numeric_columns,
+                default=correlation_numeric_columns[:8],
+                key=correlation_field_key,
+            )
+
+            correlation_method_key = _safe_streamlit_key(
+                "correlation_relationship_method_"
+                f"{active_project_id}_{correlation_dataset_key}"
+            )
+            selected_correlation_method = st.radio(
+                "相关方法",
+                ("pearson", "spearman"),
+                index=0,
+                format_func=lambda value: {
+                    "pearson": "Pearson",
+                    "spearman": "Spearman",
+                }[value],
+                horizontal=True,
+                key=correlation_method_key,
+            )
+            st.caption(
+                "Pearson 更关注线性关系；Spearman 更关注单调排序关系，"
+                "对明显偏斜和极端值通常更稳健。"
+            )
+
+            correlation_threshold_key = _safe_streamlit_key(
+                "correlation_relationship_threshold_"
+                f"{active_project_id}_{correlation_dataset_key}"
+            )
+            selected_correlation_threshold = st.slider(
+                "最低显示绝对相关系数",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.5,
+                step=0.1,
+                key=correlation_threshold_key,
+            )
+            st.caption(
+                "阈值只过滤下方字段对表格，热力图始终展示完整相关矩阵。"
+            )
+
+            correlation_selection_error = None
+            if len(selected_correlation_columns) < 2:
+                correlation_selection_error = "请至少选择两个数值字段。"
+            elif len(selected_correlation_columns) > 12:
+                correlation_selection_error = (
+                    "最多同时选择 12 个字段，请缩小分析范围。"
+                )
+            if correlation_selection_error:
+                st.info(correlation_selection_error)
+
+            correlation_result_signature = (
+                str(active_project_id),
+                correlation_dataset_key,
+                tuple(selected_correlation_columns),
+                selected_correlation_method,
+                float(selected_correlation_threshold),
+            )
+            correlation_result_key = _safe_streamlit_key(
+                "correlation_relationship_result_"
+                f"{active_project_id}_{correlation_dataset_key}"
+            )
+            if st.button(
+                "计算相关关系",
+                type="primary",
+                disabled=correlation_selection_error is not None,
+                key=_safe_streamlit_key(
+                    "correlation_relationship_calculate_"
+                    f"{active_project_id}_{correlation_dataset_key}"
+                ),
+            ):
+                try:
+                    correlation_analysis_result = (
+                        build_correlation_relationship_analysis(
+                            df=df,
+                            selected_columns=selected_correlation_columns,
+                            method=selected_correlation_method,
+                            threshold=selected_correlation_threshold,
+                        )
+                    )
+                    st.session_state[correlation_result_key] = {
+                        "signature": correlation_result_signature,
+                        "result": correlation_analysis_result,
+                    }
+                except Exception as exc:
+                    st.error(f"相关关系计算失败：{exc}")
+
+            cached_correlation_result = st.session_state.get(
+                correlation_result_key
+            )
+            correlation_analysis_result = (
+                cached_correlation_result.get("result")
+                if cached_correlation_result
+                and cached_correlation_result.get("signature")
+                == correlation_result_signature
+                else None
+            )
+            if correlation_analysis_result is not None:
+                correlation_status = correlation_analysis_result.get(
+                    "status"
+                )
+                if correlation_status == "insufficient_columns":
+                    st.info("请至少选择两个可用于分析的数值字段。")
+                elif correlation_status == "no_valid_pairs":
+                    st.info(
+                        "当前所选字段之间没有足够的共同有效记录"
+                        "用于计算相关关系。"
+                    )
+                elif correlation_status != "ok":
+                    st.error("当前相关关系分析状态无法识别，请重新计算。")
+                else:
+                    excluded_correlation_columns = (
+                        correlation_analysis_result.get(
+                            "excluded_columns",
+                            [],
+                        )
+                    )
+                    if excluded_correlation_columns:
+                        with st.expander(
+                            "查看未参与计算的字段",
+                            expanded=False,
+                        ):
+                            st.dataframe(
+                                pd.DataFrame(
+                                    [
+                                        {
+                                            "字段": column,
+                                            "排除原因": (
+                                                "未满足相关关系计算条件"
+                                            ),
+                                        }
+                                        for column in (
+                                            excluded_correlation_columns
+                                        )
+                                    ]
+                                ),
+                                use_container_width=True,
+                                hide_index=True,
+                                height=calculate_dataframe_height(
+                                    len(excluded_correlation_columns)
+                                ),
+                            )
+
+                    correlation_matrix = (
+                        correlation_analysis_result["matrix"]
+                    )
+                    correlation_matrix_columns = correlation_matrix[
+                        "columns"
+                    ]
+                    correlation_matrix_rows = correlation_matrix["rows"]
+                    correlation_matrix_text = [
+                        [
+                            "—" if value is None else f"{value:.2f}"
+                            for value in row
+                        ]
+                        for row in correlation_matrix_rows
+                    ]
+                    st.markdown("#### 数值字段相关矩阵")
+                    correlation_method_label = {
+                        "pearson": "Pearson",
+                        "spearman": "Spearman",
+                    }[correlation_analysis_result["method"]]
+                    correlation_matrix_figure = go.Figure(
+                        data=go.Heatmap(
+                            z=correlation_matrix_rows,
+                            x=correlation_matrix_columns,
+                            y=correlation_matrix_columns,
+                            zmin=-1,
+                            zmax=1,
+                            colorscale="RdBu",
+                            reversescale=True,
+                            text=correlation_matrix_text,
+                            texttemplate="%{text}",
+                            hovertemplate=(
+                                "字段 A：%{y}<br>"
+                                "字段 B：%{x}<br>"
+                                "相关系数：%{text}<extra></extra>"
+                            ),
+                            colorbar={"title": "相关系数"},
+                        )
+                    )
+                    correlation_matrix_figure.update_layout(
+                        title=f"{correlation_method_label} 相关矩阵",
+                        xaxis={"side": "bottom"},
+                        yaxis={"autorange": "reversed"},
+                    )
+                    st.plotly_chart(
+                        correlation_matrix_figure,
+                        use_container_width=True,
+                        key=_safe_streamlit_key(
+                            "correlation_relationship_matrix_"
+                            f"{active_project_id}_"
+                            f"{correlation_dataset_key}_"
+                            f"{selected_correlation_method}"
+                        ),
+                    )
+
+                    with st.expander(
+                        "查看字段对有效样本量",
+                        expanded=False,
+                    ):
+                        sample_size_matrix = (
+                            correlation_analysis_result[
+                                "sample_size_matrix"
+                            ]
+                        )
+                        sample_size_columns = sample_size_matrix["columns"]
+                        sample_size_table = pd.DataFrame(
+                            [
+                                [
+                                    (
+                                        "—"
+                                        if value is None
+                                        else f"{int(value):,}"
+                                    )
+                                    for value in row
+                                ]
+                                for row in sample_size_matrix["rows"]
+                            ],
+                            columns=sample_size_columns,
+                        )
+                        sample_size_table.insert(
+                            0,
+                            "字段",
+                            sample_size_columns,
+                        )
+                        st.dataframe(
+                            sample_size_table,
+                            use_container_width=True,
+                            hide_index=True,
+                            height=calculate_dataframe_height(
+                                len(sample_size_table)
+                            ),
+                        )
+
+                    st.markdown("#### 达到当前阈值的字段对")
+                    st.caption(
+                        "当前显示条件："
+                        f"|r| ≥ {correlation_analysis_result['threshold']:g}"
+                    )
+                    displayed_correlation_pairs = (
+                        correlation_analysis_result["pairs"]
+                    )
+                    if not displayed_correlation_pairs:
+                        st.info(
+                            "当前没有字段对达到 "
+                            f"|r| ≥ {correlation_analysis_result['threshold']:g} "
+                            "的显示阈值。可以调低阈值查看较弱关系。"
+                        )
+                    else:
+                        correlation_pair_table = pd.DataFrame(
+                            [
+                                {
+                                    "字段 A": item["field_a"],
+                                    "字段 B": item["field_b"],
+                                    "相关方向": item["direction"],
+                                    "相关系数": (
+                                        f"{item['correlation']:.2f}"
+                                    ),
+                                    "关系强度": item["strength"],
+                                    "有效样本数": (
+                                        f"{item['sample_size']:,}"
+                                    ),
+                                    "样本状态": item["sample_status"],
+                                }
+                                for item in displayed_correlation_pairs
+                            ]
+                        )
+                        st.dataframe(
+                            correlation_pair_table,
+                            use_container_width=True,
+                            hide_index=True,
+                            height=calculate_dataframe_height(
+                                len(correlation_pair_table)
+                            ),
+                        )
+
+                    if any(
+                        item.get("warning")
+                        for item in correlation_analysis_result.get(
+                            "all_pairs",
+                            [],
+                        )
+                    ):
+                        st.info(
+                            "部分字段对接近完全相关，可能存在重复字段、"
+                            "单位转换或直接计算关系，请检查字段定义。"
+                        )
+
+                    st.markdown("#### 相关关系解读")
+                    st.write(
+                        correlation_analysis_result["interpretation"]
+                    )
 
     with exploration_tabs[4]:
         render_module_intro(
