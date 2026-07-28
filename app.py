@@ -93,6 +93,7 @@ from src.exploration import (
     build_categorical_composition_analysis,
     build_categorical_top_n_chart_data,
     build_correlation_relationship_analysis,
+    build_correlation_scatter_data,
     build_exploration_field_roles,
     build_exploration_overview,
     build_numeric_distribution_analysis,
@@ -6648,6 +6649,199 @@ with workbench_tabs[0]:
                     st.write(
                         correlation_analysis_result["interpretation"]
                     )
+
+                    st.markdown("#### 查看字段对分布")
+                    st.caption(
+                        "散点图用于查看两个字段的实际分布形态。"
+                        "相关系数相同的字段对，也可能呈现不同的数据结构。"
+                    )
+                    scatter_field_set_signature = hashlib.md5(
+                        json.dumps(
+                            selected_correlation_columns,
+                            ensure_ascii=False,
+                        ).encode("utf-8")
+                    ).hexdigest()[:12]
+                    scatter_x_key = _safe_streamlit_key(
+                        "correlation_scatter_x_"
+                        f"{active_project_id}_{correlation_dataset_key}_"
+                        f"{scatter_field_set_signature}"
+                    )
+                    if (
+                        st.session_state.get(scatter_x_key)
+                        not in selected_correlation_columns
+                    ):
+                        st.session_state[scatter_x_key] = (
+                            selected_correlation_columns[0]
+                        )
+                    scatter_axis_columns = st.columns(2)
+                    selected_scatter_x = scatter_axis_columns[0].selectbox(
+                        "横轴字段",
+                        selected_correlation_columns,
+                        key=scatter_x_key,
+                    )
+
+                    scatter_y_options = [
+                        column
+                        for column in selected_correlation_columns
+                        if column != selected_scatter_x
+                    ]
+                    scatter_y_key = _safe_streamlit_key(
+                        "correlation_scatter_y_"
+                        f"{active_project_id}_{correlation_dataset_key}_"
+                        f"{scatter_field_set_signature}"
+                    )
+                    if (
+                        st.session_state.get(scatter_y_key)
+                        not in scatter_y_options
+                    ):
+                        default_scatter_y = (
+                            selected_correlation_columns[1]
+                            if selected_correlation_columns[1]
+                            in scatter_y_options
+                            else scatter_y_options[0]
+                        )
+                        st.session_state[scatter_y_key] = default_scatter_y
+                    selected_scatter_y = scatter_axis_columns[1].selectbox(
+                        "纵轴字段",
+                        scatter_y_options,
+                        key=scatter_y_key,
+                    )
+
+                    try:
+                        correlation_scatter_result = (
+                            build_correlation_scatter_data(
+                                df=df,
+                                field_x=selected_scatter_x,
+                                field_y=selected_scatter_y,
+                                method=selected_correlation_method,
+                                max_points=5000,
+                                random_state=42,
+                            )
+                        )
+                    except Exception as exc:
+                        st.error(f"字段对散点分布生成失败：{exc}")
+                    else:
+                        scatter_status = correlation_scatter_result.get(
+                            "status"
+                        )
+                        if scatter_status == "invalid_fields":
+                            st.info(
+                                "当前选择的字段无法用于散点图，"
+                                "请重新选择两个不同的数值字段。"
+                            )
+                        elif scatter_status == "insufficient_data":
+                            st.info(
+                                "当前字段对的共同有效记录少于 5 条，"
+                                "无法生成可靠的散点分布。"
+                            )
+                        elif scatter_status != "ok":
+                            st.error(
+                                "当前散点分布状态无法识别，请重新选择字段。"
+                            )
+                        else:
+                            scatter_method_label = {
+                                "pearson": "Pearson",
+                                "spearman": "Spearman",
+                            }[correlation_scatter_result["method"]]
+                            scatter_overview_columns = st.columns(4)
+                            scatter_overview_columns[0].metric(
+                                "当前相关方法",
+                                scatter_method_label,
+                            )
+                            scatter_overview_columns[1].metric(
+                                "相关系数",
+                                (
+                                    f"{correlation_scatter_result['correlation']:.3f}"
+                                ),
+                            )
+                            scatter_overview_columns[2].metric(
+                                "全部有效样本数",
+                                (
+                                    f"{correlation_scatter_result['sample_size']:,}"
+                                ),
+                            )
+                            scatter_overview_columns[3].metric(
+                                "图表展示点数",
+                                (
+                                    f"{correlation_scatter_result['displayed_point_count']:,}"
+                                ),
+                            )
+
+                            if (
+                                5
+                                <= correlation_scatter_result["sample_size"]
+                                < 20
+                            ):
+                                st.caption(
+                                    "当前字段对的有效样本较少，"
+                                    "相关系数和分布形态可能不稳定。"
+                                )
+                            if correlation_scatter_result["is_sampled"]:
+                                st.caption(
+                                    "为保证图表可读性，散点图展示 5,000 个"
+                                    "稳定抽样点；相关系数仍基于全部有效记录计算。"
+                                )
+
+                            scatter_field_x = correlation_scatter_result[
+                                "field_x"
+                            ]
+                            scatter_field_y = correlation_scatter_result[
+                                "field_y"
+                            ]
+                            scatter_chart_data = pd.DataFrame(
+                                {
+                                    scatter_field_x: [
+                                        item["x"]
+                                        for item in (
+                                            correlation_scatter_result["rows"]
+                                        )
+                                    ],
+                                    scatter_field_y: [
+                                        item["y"]
+                                        for item in (
+                                            correlation_scatter_result["rows"]
+                                        )
+                                    ],
+                                }
+                            )
+                            scatter_figure = px.scatter(
+                                scatter_chart_data,
+                                x=scatter_field_x,
+                                y=scatter_field_y,
+                                title=(
+                                    f"{scatter_field_x} 与 "
+                                    f"{scatter_field_y} 的散点分布"
+                                ),
+                            )
+                            st.plotly_chart(
+                                scatter_figure,
+                                use_container_width=True,
+                                key=_safe_streamlit_key(
+                                    "correlation_scatter_chart_"
+                                    f"{active_project_id}_"
+                                    f"{correlation_dataset_key}_"
+                                    f"{scatter_field_set_signature}_"
+                                    f"{selected_scatter_x}_"
+                                    f"{selected_scatter_y}_"
+                                    f"{selected_correlation_method}"
+                                ),
+                            )
+                            st.caption(
+                                "散点图只能帮助观察字段之间的分布形态，"
+                                "不能证明一个字段导致另一个字段变化。"
+                            )
+                            if (
+                                abs(
+                                    correlation_scatter_result[
+                                        "correlation"
+                                    ]
+                                )
+                                >= 0.9999
+                            ):
+                                st.info(
+                                    "该字段对接近完全相关，可能存在重复字段、"
+                                    "单位转换或直接计算关系，请检查字段定义。"
+                                )
 
     with exploration_tabs[4]:
         render_module_intro(

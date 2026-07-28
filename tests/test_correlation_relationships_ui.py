@@ -327,8 +327,8 @@ def test_page_has_no_p_value_or_regression_content():
         assert term not in CORRELATION_TAB_SOURCE
 
 
-def test_page_does_not_call_scatter_helper():
-    assert "build_correlation_scatter_data" not in CORRELATION_TAB_SOURCE
+def test_page_calls_scatter_helper():
+    assert "build_correlation_scatter_data(" in CORRELATION_TAB_SOURCE
 
 
 def test_old_page_helpers_are_not_rendered_in_new_tab():
