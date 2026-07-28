@@ -665,6 +665,373 @@ def categorical_composition_table_title(category_count, display_limit=5000):
     return "完整类别构成表"
 
 
+TIME_GRANULARITIES = ("day", "week", "month", "quarter", "year")
+_TIME_GRANULARITY_LABELS = {
+    "day": "日",
+    "week": "周",
+    "month": "月",
+    "quarter": "季度",
+    "year": "年",
+}
+TIME_DISTRIBUTION_MAX_POINTS = 400
+
+
+def build_time_distribution_analysis(series, field_name, granularity=None):
+    """Build a complete natural-period time distribution without side effects."""
+    if granularity is not None and granularity not in TIME_GRANULARITIES:
+        raise ValueError(
+            "不支持的时间粒度。可选值为 day、week、month、quarter、year。"
+        )
+
+    total_count = len(series)
+    valid_dates = _clean_time_distribution_dates(series)
+    valid_count = len(valid_dates)
+    selected_granularity = granularity or "day"
+    if valid_count == 0:
+        return {
+            "status": "no_valid_dates",
+            "field_name": str(field_name),
+            "total_count": int(total_count),
+            "valid_count": 0,
+            "excluded_count": int(total_count),
+            "start_date": None,
+            "end_date": None,
+            "calendar_span_days": 0,
+            "active_date_count": 0,
+            "recommended_granularity": "day",
+            "selected_granularity": selected_granularity,
+            "period_count": 0,
+            "active_period_count": 0,
+            "zero_period_count": 0,
+            "peak_period": None,
+            "peak_count": 0,
+            "rows": [],
+            "zero_ranges": [],
+            "interpretation": "当前字段没有可用于时间分布分析的有效日期。",
+        }
+
+    start_day = valid_dates.min()
+    end_day = valid_dates.max()
+    calendar_span_days = int((end_day - start_day).days) + 1
+    active_date_count = int(valid_dates.nunique())
+    recommended_granularity = _recommend_time_granularity(
+        start_day,
+        end_day,
+        calendar_span_days,
+    )
+    selected_granularity = granularity or recommended_granularity
+
+    period_keys = valid_dates.map(
+        lambda value: _time_period_start(value, selected_granularity)
+    )
+    period_counts = period_keys.value_counts(sort=False).sort_index()
+    first_period_start = _time_period_start(
+        start_day,
+        selected_granularity,
+    )
+    last_period_start = _time_period_start(
+        end_day,
+        selected_granularity,
+    )
+    period_count = _time_period_count(
+        first_period_start,
+        last_period_start,
+        selected_granularity,
+    )
+    active_period_count = int(len(period_counts))
+    zero_period_count = int(period_count - active_period_count)
+    peak_count = int(period_counts.max())
+    peak_start = min(
+        period_start
+        for period_start, count in period_counts.items()
+        if int(count) == peak_count
+    )
+    peak_period = _time_period_label(
+        peak_start,
+        _time_period_end(peak_start, selected_granularity),
+        selected_granularity,
+    )
+
+    base_result = {
+        "status": "ok",
+        "field_name": str(field_name),
+        "total_count": int(total_count),
+        "valid_count": int(valid_count),
+        "excluded_count": int(total_count - valid_count),
+        "start_date": start_day.strftime("%Y-%m-%d"),
+        "end_date": end_day.strftime("%Y-%m-%d"),
+        "calendar_span_days": calendar_span_days,
+        "active_date_count": active_date_count,
+        "recommended_granularity": recommended_granularity,
+        "selected_granularity": selected_granularity,
+        "period_count": int(period_count),
+        "active_period_count": active_period_count,
+        "zero_period_count": zero_period_count,
+        "peak_period": peak_period,
+        "peak_count": peak_count,
+        "rows": [],
+        "zero_ranges": [],
+        "interpretation": "",
+    }
+
+    if period_count > TIME_DISTRIBUTION_MAX_POINTS:
+        base_result["status"] = "too_dense"
+        base_result["interpretation"] = (
+            f"当前数据覆盖 {base_result['start_date']} 至 "
+            f"{base_result['end_date']}。"
+            f"按{_TIME_GRANULARITY_LABELS[selected_granularity]}统计将生成 "
+            f"{period_count:,} 个时间点，超过 "
+            f"{TIME_DISTRIBUTION_MAX_POINTS} 个时间点。"
+            "请选择更粗粒度后查看时间分布。"
+        )
+        return base_result
+
+    rows = []
+    for period_start in _time_period_starts(
+        first_period_start,
+        last_period_start,
+        selected_granularity,
+    ):
+        period_end = _time_period_end(
+            period_start,
+            selected_granularity,
+        )
+        count = int(period_counts.get(period_start, 0))
+        rows.append(
+            {
+                "period_start": period_start.strftime("%Y-%m-%d"),
+                "period_end": period_end.strftime("%Y-%m-%d"),
+                "period_label": _time_period_label(
+                    period_start,
+                    period_end,
+                    selected_granularity,
+                ),
+                "count": count,
+                "ratio": float(count / valid_count) if count else 0.0,
+            }
+        )
+
+    zero_ranges = _build_zero_time_ranges(
+        rows,
+        selected_granularity,
+    )
+    base_result["rows"] = rows
+    base_result["zero_ranges"] = zero_ranges
+    if active_date_count == 1:
+        base_result["status"] = "single_date"
+    base_result["interpretation"] = generate_time_distribution_interpretation(
+        base_result
+    )
+    return base_result
+
+
+def generate_time_distribution_interpretation(analysis_result):
+    """Generate a neutral interpretation of time coverage and record counts."""
+    status = analysis_result.get("status")
+    if status == "no_valid_dates":
+        return "当前字段没有可用于时间分布分析的有效日期。"
+    if status == "too_dense":
+        return analysis_result.get("interpretation", "")
+    if status == "single_date":
+        return (
+            f"当前有效日期记录均落在 {analysis_result['start_date']}，"
+            f"共 {analysis_result['valid_count']:,} 条记录。"
+        )
+
+    granularity_label = _TIME_GRANULARITY_LABELS[
+        analysis_result["selected_granularity"]
+    ]
+    descriptions = [
+        (
+            f"当前数据覆盖 {analysis_result['start_date']} 至 "
+            f"{analysis_result['end_date']}。"
+        ),
+        (
+            f"按{granularity_label}统计共包含 "
+            f"{analysis_result['period_count']:,} 个时间段，"
+            f"其中 {analysis_result['active_period_count']:,} 个时间段存在记录，"
+            f"{analysis_result['zero_period_count']:,} 个时间段无记录。"
+        ),
+        (
+            f"记录数最高的时间段为 {analysis_result['peak_period']}，"
+            f"共 {analysis_result['peak_count']:,} 条记录。"
+        ),
+    ]
+    zero_ranges = analysis_result.get("zero_ranges", [])
+    if zero_ranges:
+        longest_range = zero_ranges[0]
+        descriptions.append(
+            f"最长连续无记录时间段为 {longest_range['start_label']} 至 "
+            f"{longest_range['end_label']}，"
+            f"共 {longest_range['period_count']:,} 个时间段。"
+        )
+    if analysis_result.get("period_count") == 1:
+        descriptions.append(
+            "当前粒度下只有一个时间段，可选择更细粒度查看记录分布。"
+        )
+    descriptions.append(
+        "无记录时间段不一定表示数据缺失，也可能是当时没有业务活动，"
+        "请结合业务日历核验。"
+    )
+    return "".join(descriptions)
+
+
+def _clean_time_distribution_dates(series):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        parsed = pd.to_datetime(
+            series.copy(deep=True),
+            errors="coerce",
+        )
+    parsed_series = pd.Series(
+        parsed,
+        index=series.index,
+        name=series.name,
+    )
+    local_days = []
+    for value in parsed_series.dropna().tolist():
+        timestamp = pd.Timestamp(value)
+        if timestamp.tzinfo is not None:
+            timestamp = timestamp.tz_localize(None)
+        local_days.append(timestamp.normalize())
+    return pd.Series(local_days, dtype="datetime64[ns]")
+
+
+def _recommend_time_granularity(start_day, end_day, calendar_span_days):
+    if calendar_span_days <= 90:
+        return "day"
+    if end_day <= start_day + pd.DateOffset(years=2):
+        return "week"
+    if end_day <= start_day + pd.DateOffset(years=8):
+        return "month"
+    return "year"
+
+
+def _time_period_start(value, granularity):
+    timestamp = pd.Timestamp(value).normalize()
+    if granularity == "day":
+        return timestamp
+    if granularity == "week":
+        return timestamp - pd.Timedelta(days=timestamp.weekday())
+    if granularity == "month":
+        return pd.Timestamp(timestamp.year, timestamp.month, 1)
+    if granularity == "quarter":
+        quarter_month = ((timestamp.month - 1) // 3) * 3 + 1
+        return pd.Timestamp(timestamp.year, quarter_month, 1)
+    return pd.Timestamp(timestamp.year, 1, 1)
+
+
+def _time_period_end(period_start, granularity):
+    if granularity == "day":
+        return period_start
+    if granularity == "week":
+        return period_start + pd.Timedelta(days=6)
+    if granularity == "month":
+        return period_start + pd.offsets.MonthEnd(0)
+    if granularity == "quarter":
+        return period_start + pd.DateOffset(months=3) - pd.Timedelta(days=1)
+    return pd.Timestamp(period_start.year, 12, 31)
+
+
+def _time_period_label(period_start, period_end, granularity):
+    if granularity == "day":
+        return period_start.strftime("%Y-%m-%d")
+    if granularity == "week":
+        return (
+            f"{period_start.strftime('%Y-%m-%d')} 至 "
+            f"{period_end.strftime('%Y-%m-%d')}"
+        )
+    if granularity == "month":
+        return period_start.strftime("%Y-%m")
+    if granularity == "quarter":
+        quarter = (period_start.month - 1) // 3 + 1
+        return f"{period_start.year} Q{quarter}"
+    return str(period_start.year)
+
+
+def _time_period_count(first_period_start, last_period_start, granularity):
+    if granularity == "day":
+        return int((last_period_start - first_period_start).days) + 1
+    if granularity == "week":
+        return int((last_period_start - first_period_start).days // 7) + 1
+    if granularity == "month":
+        return (
+            (last_period_start.year - first_period_start.year) * 12
+            + last_period_start.month
+            - first_period_start.month
+            + 1
+        )
+    if granularity == "quarter":
+        first_quarter = (first_period_start.month - 1) // 3
+        last_quarter = (last_period_start.month - 1) // 3
+        return (
+            (last_period_start.year - first_period_start.year) * 4
+            + last_quarter
+            - first_quarter
+            + 1
+        )
+    return last_period_start.year - first_period_start.year + 1
+
+
+def _time_period_starts(first_period_start, last_period_start, granularity):
+    frequency_by_granularity = {
+        "day": "D",
+        "week": "7D",
+        "month": "MS",
+        "quarter": "QS",
+        "year": "YS",
+    }
+    return pd.date_range(
+        first_period_start,
+        last_period_start,
+        freq=frequency_by_granularity[granularity],
+    )
+
+
+def _build_zero_time_ranges(rows, granularity):
+    zero_segments = []
+    segment_start = None
+    for index, row in enumerate(rows):
+        if row["count"] == 0 and segment_start is None:
+            segment_start = index
+        is_segment_end = (
+            segment_start is not None
+            and (
+                row["count"] != 0
+                or index == len(rows) - 1
+            )
+        )
+        if not is_segment_end:
+            continue
+
+        segment_end = (
+            index
+            if row["count"] == 0
+            else index - 1
+        )
+        start_row = rows[segment_start]
+        end_row = rows[segment_end]
+        zero_segments.append(
+            {
+                "start_label": start_row["period_label"],
+                "end_label": end_row["period_label"],
+                "start_date": start_row["period_start"],
+                "end_date": end_row["period_end"],
+                "period_count": segment_end - segment_start + 1,
+                "granularity": granularity,
+            }
+        )
+        segment_start = None
+
+    zero_segments.sort(
+        key=lambda item: (
+            -item["period_count"],
+            item["start_date"],
+        )
+    )
+    return zero_segments[:10]
+
+
 def get_analysis_numeric_columns(df: pd.DataFrame, identifier_columns: list[str]) -> list[str]:
     identifiers = set(identifier_columns)
     return [
