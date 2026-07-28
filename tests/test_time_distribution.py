@@ -2,7 +2,10 @@ import json
 
 import pandas as pd
 
-from src.exploration import build_time_distribution_analysis
+from src.exploration import (
+    build_time_distribution_analysis,
+    parse_exploration_datetime_series,
+)
 
 
 def test_normal_date_field_builds_analysis():
@@ -33,6 +36,100 @@ def test_unparseable_strings_are_excluded():
 
     assert result["valid_count"] == 2
     assert result["excluded_count"] == 1
+
+
+def test_mixed_datetime_string_formats_are_all_valid():
+    result = build_time_distribution_analysis(
+        pd.Series(
+            [
+                "2020-04-01 00:00:00",
+                "2020-05-31 00:00:00",
+                "2020-06-01",
+                "2020-06-30",
+            ]
+        ),
+        "成交日期",
+    )
+
+    assert result["valid_count"] == 4
+    assert result["excluded_count"] == 0
+    assert result["start_date"] == "2020-04-01"
+    assert result["end_date"] == "2020-06-30"
+
+
+def test_mixed_datetime_formats_keep_all_3988_reproduction_rows():
+    april_and_may = pd.date_range("2020-04-01", "2020-05-31")
+    june = pd.date_range("2020-06-01", "2020-06-30")
+    values = [
+        april_and_may[index % len(april_and_may)].strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        for index in range(1657)
+    ]
+    values.extend(
+        june[index % len(june)].strftime("%Y-%m-%d")
+        for index in range(2331)
+    )
+
+    result = build_time_distribution_analysis(
+        pd.Series(values),
+        "成交日期",
+    )
+
+    assert result["total_count"] == 3988
+    assert result["valid_count"] == 3988
+    assert result["excluded_count"] == 0
+    assert result["start_date"] == "2020-04-01"
+    assert result["end_date"] == "2020-06-30"
+    assert result["calendar_span_days"] == 91
+    assert result["active_date_count"] == 91
+
+
+def test_invalid_value_is_excluded_without_losing_mixed_valid_formats():
+    result = build_time_distribution_analysis(
+        pd.Series(
+            [
+                "2020-04-01 00:00:00",
+                "2020-06-01",
+                "not-a-date",
+                "2020-06-30",
+            ]
+        ),
+        "成交日期",
+    )
+
+    assert result["total_count"] == 4
+    assert result["valid_count"] == 3
+    assert result["excluded_count"] == 1
+    assert result["start_date"] == "2020-04-01"
+    assert result["end_date"] == "2020-06-30"
+
+
+def test_native_datetime_series_uses_safe_datetime_parsing():
+    series = pd.Series(
+        pd.to_datetime(["2020-04-01", "2020-06-30"]),
+        name="成交日期",
+    )
+
+    parsed = parse_exploration_datetime_series(series)
+    result = build_time_distribution_analysis(series, "成交日期")
+
+    pd.testing.assert_series_equal(parsed, series)
+    assert result["valid_count"] == 2
+    assert result["start_date"] == "2020-04-01"
+    assert result["end_date"] == "2020-06-30"
+
+
+def test_datetime_parser_does_not_modify_input_series():
+    series = pd.Series(
+        ["2020-04-01 00:00:00", "2020-06-01", "not-a-date"],
+        name="成交日期",
+    )
+    original = series.copy(deep=True)
+
+    parse_exploration_datetime_series(series)
+
+    pd.testing.assert_series_equal(series, original)
 
 
 def test_input_series_is_not_modified():

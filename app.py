@@ -95,14 +95,19 @@ from src.exploration import (
     build_exploration_field_roles,
     build_exploration_overview,
     build_numeric_distribution_analysis,
+    build_time_distribution_analysis,
+    build_time_distribution_view_data,
     calculate_dataframe_height,
     calculate_correlation_pairs,
     categorical_composition_table_title,
     generate_categorical_composition_interpretation,
     get_analysis_categorical_columns,
     get_analysis_numeric_columns,
+    get_time_distribution_datetime_columns,
     summarize_categorical_columns,
     summarize_numeric_columns,
+    TIME_GRANULARITIES,
+    TIME_GRANULARITY_LABELS,
 )
 from src.outlier import (
     calculate_iqr_bounds,
@@ -5468,7 +5473,7 @@ with workbench_tabs[0]:
         elif datetime_summary["mode"] == "multiple":
             st.caption(
                 f"检测到 {datetime_summary['column_count']} 个日期字段，"
-                "请在后续【时间分布】中选择需要分析的字段。"
+                "请在【时间分布】中选择需要分析的字段。"
             )
         else:
             st.caption("当前数据集未检测到可用的完整日期字段。")
@@ -5500,7 +5505,9 @@ with workbench_tabs[0]:
                 st.caption("当前没有需要排除的字段。")
 
     st.divider()
-    exploration_tabs = st.tabs(["数值分布", "类别构成", "相关分析", "AI 探索洞察"])
+    exploration_tabs = st.tabs(
+        ["数值分布", "类别构成", "时间分布", "相关分析", "AI 探索洞察"]
+    )
 
     with exploration_tabs[0]:
         st.subheader("数值分布")
@@ -6002,6 +6009,302 @@ with workbench_tabs[0]:
                     )
 
     with exploration_tabs[2]:
+        st.subheader("时间分布")
+        st.caption(
+            "用于查看日期字段的数据覆盖范围和各时间段的记录数分布。"
+            "此处展示的是当前分析数据集的记录数量，"
+            "不代表成交金额、订单量或业务表现。"
+        )
+        st.caption(
+            "无记录时间段不一定表示数据缺失，也可能是当时没有业务活动，"
+            "请结合业务日历核验。"
+        )
+        time_distribution_columns = get_time_distribution_datetime_columns(
+            df,
+            exploration_field_roles or {},
+        )
+        if not time_distribution_columns:
+            st.info("当前数据集没有可用于时间分布分析的完整日期字段。")
+        else:
+            time_distribution_dataset_key = str(
+                current_analysis_dataset.get("dataset_id")
+                or current_analysis_dataset.get("file_path")
+                or current_analysis_dataset.get("dataset_name")
+                or analysis_key
+            )
+            time_field_selector_key = _safe_streamlit_key(
+                "time_distribution_field_"
+                f"{active_project_id}_{time_distribution_dataset_key}"
+            )
+            if (
+                st.session_state.get(time_field_selector_key)
+                not in time_distribution_columns
+            ):
+                st.session_state.pop(time_field_selector_key, None)
+            selected_time_field = st.selectbox(
+                "选择日期字段",
+                time_distribution_columns,
+                index=0,
+                key=time_field_selector_key,
+            )
+
+            try:
+                recommended_time_analysis = build_time_distribution_analysis(
+                    df[selected_time_field],
+                    selected_time_field,
+                )
+            except Exception as exc:
+                st.error(f"时间分布分析失败：{exc}")
+            else:
+                if recommended_time_analysis["excluded_count"] > 0:
+                    st.caption(
+                        f"本次时间分布使用 "
+                        f"{recommended_time_analysis['valid_count']:,} 条有效日期记录，"
+                        f"另有 {recommended_time_analysis['excluded_count']:,} 条缺失或"
+                        "无法解析的日期未参与分析。可前往【数据质量】查看。"
+                    )
+
+                if recommended_time_analysis["status"] == "no_valid_dates":
+                    st.info("当前字段没有可用于时间分布分析的有效日期。")
+                else:
+                    st.markdown("#### 时间概览")
+                    time_overview_cards = st.columns(5)
+                    time_overview_cards[0].metric(
+                        "有效日期记录数",
+                        f"{recommended_time_analysis['valid_count']:,}",
+                    )
+                    time_overview_cards[1].metric(
+                        "起始日期",
+                        recommended_time_analysis["start_date"],
+                    )
+                    time_overview_cards[2].metric(
+                        "结束日期",
+                        recommended_time_analysis["end_date"],
+                    )
+                    time_overview_cards[3].metric(
+                        "日历覆盖跨度",
+                        f"{recommended_time_analysis['calendar_span_days']:,} 天",
+                    )
+                    time_overview_cards[4].metric(
+                        "有记录日期数",
+                        f"{recommended_time_analysis['active_date_count']:,}",
+                    )
+
+                    if recommended_time_analysis["status"] == "single_date":
+                        st.info("当前字段只覆盖一个有效自然日，无法形成时间分布。")
+                    else:
+                        recommended_granularity = (
+                            recommended_time_analysis[
+                                "recommended_granularity"
+                            ]
+                        )
+                        time_granularity_key = _safe_streamlit_key(
+                            "time_distribution_granularity_"
+                            f"{active_project_id}_"
+                            f"{time_distribution_dataset_key}_"
+                            f"{selected_time_field}"
+                        )
+                        last_time_field_key = _safe_streamlit_key(
+                            "time_distribution_last_field_"
+                            f"{active_project_id}_"
+                            f"{time_distribution_dataset_key}"
+                        )
+                        if (
+                            st.session_state.get(last_time_field_key)
+                            != selected_time_field
+                        ):
+                            st.session_state.pop(
+                                time_granularity_key,
+                                None,
+                            )
+                            st.session_state[last_time_field_key] = (
+                                selected_time_field
+                            )
+                        elif (
+                            st.session_state.get(time_granularity_key)
+                            not in TIME_GRANULARITIES
+                        ):
+                            st.session_state.pop(
+                                time_granularity_key,
+                                None,
+                            )
+
+                        selected_time_granularity = st.selectbox(
+                            "时间粒度",
+                            list(TIME_GRANULARITIES),
+                            index=list(TIME_GRANULARITIES).index(
+                                recommended_granularity
+                            ),
+                            format_func=lambda value: (
+                                TIME_GRANULARITY_LABELS[value]
+                            ),
+                            key=time_granularity_key,
+                        )
+                        try:
+                            selected_time_analysis = (
+                                build_time_distribution_analysis(
+                                    df[selected_time_field],
+                                    selected_time_field,
+                                    granularity=selected_time_granularity,
+                                )
+                            )
+                        except Exception as exc:
+                            st.error(f"时间分布分析失败：{exc}")
+                        else:
+                            time_view_data = (
+                                build_time_distribution_view_data(
+                                    selected_time_analysis
+                                )
+                            )
+                            if not time_view_data["known_status"]:
+                                st.error("当前时间分布状态无法识别，请重新选择字段或粒度。")
+                            elif selected_time_analysis["status"] == "too_dense":
+                                st.info(
+                                    "当前粒度将生成 "
+                                    f"{selected_time_analysis['period_count']:,} "
+                                    "个时间点，图表可读性较低，"
+                                    "请选择更粗的时间粒度。"
+                                )
+                            elif selected_time_analysis["status"] == "single_date":
+                                st.info(
+                                    "当前字段只覆盖一个有效自然日，"
+                                    "无法形成时间分布。"
+                                )
+                            elif selected_time_analysis["status"] == "no_valid_dates":
+                                st.info(
+                                    "当前字段没有可用于时间分布分析的有效日期。"
+                                )
+                            elif time_view_data["show_chart"]:
+                                if selected_time_analysis["period_count"] == 1:
+                                    st.caption(
+                                        "当前粒度下只有一个时间段，"
+                                        "可选择更细粒度查看记录分布。"
+                                    )
+
+                                time_chart_frame = pd.DataFrame(
+                                    {
+                                        "时间段": [
+                                            item["period_label"]
+                                            for item in time_view_data[
+                                                "chart_rows"
+                                            ]
+                                        ],
+                                        "记录数": [
+                                            item["count"]
+                                            for item in time_view_data[
+                                                "chart_rows"
+                                            ]
+                                        ],
+                                    }
+                                )
+                                time_figure = px.bar(
+                                    time_chart_frame,
+                                    x="时间段",
+                                    y="记录数",
+                                    title=(
+                                        f"{selected_time_field}按"
+                                        f"{TIME_GRANULARITY_LABELS[selected_time_granularity]}"
+                                        "记录数分布"
+                                    ),
+                                    category_orders={
+                                        "时间段": time_chart_frame[
+                                            "时间段"
+                                        ].tolist()
+                                    },
+                                )
+                                time_figure.update_layout(
+                                    xaxis={"automargin": True},
+                                )
+                                st.plotly_chart(
+                                    time_figure,
+                                    use_container_width=True,
+                                    key=_safe_streamlit_key(
+                                        "time_distribution_chart_"
+                                        f"{active_project_id}_"
+                                        f"{time_distribution_dataset_key}_"
+                                        f"{selected_time_field}_"
+                                        f"{selected_time_granularity}"
+                                    ),
+                                )
+
+                                with st.expander(
+                                    "查看时间分布明细",
+                                    expanded=False,
+                                ):
+                                    time_detail_table = pd.DataFrame(
+                                        [
+                                            {
+                                                "时间段": item["period_label"],
+                                                "记录数": item["count"],
+                                                "记录数占比": (
+                                                    f"{item['ratio'] * 100:.2f}%"
+                                                ),
+                                            }
+                                            for item in time_view_data[
+                                                "detail_rows"
+                                            ]
+                                        ]
+                                    )
+                                    st.dataframe(
+                                        time_detail_table,
+                                        use_container_width=True,
+                                        hide_index=True,
+                                        height=calculate_dataframe_height(
+                                            len(time_detail_table)
+                                        ),
+                                    )
+
+                                with st.expander(
+                                    "查看连续无记录时间段",
+                                    expanded=False,
+                                ):
+                                    if not time_view_data["zero_ranges"]:
+                                        st.caption(
+                                            "当前时间范围内没有无记录时间段。"
+                                        )
+                                    else:
+                                        zero_range_table = pd.DataFrame(
+                                            [
+                                                {
+                                                    "开始时间": item[
+                                                        "start_label"
+                                                    ],
+                                                    "结束时间": item[
+                                                        "end_label"
+                                                    ],
+                                                    "连续时段数": item[
+                                                        "period_count"
+                                                    ],
+                                                    "时间粒度": (
+                                                        TIME_GRANULARITY_LABELS[
+                                                            item["granularity"]
+                                                        ]
+                                                    ),
+                                                }
+                                                for item in time_view_data[
+                                                    "zero_ranges"
+                                                ]
+                                            ]
+                                        )
+                                        st.dataframe(
+                                            zero_range_table,
+                                            use_container_width=True,
+                                            hide_index=True,
+                                            height=calculate_dataframe_height(
+                                                len(zero_range_table)
+                                            ),
+                                        )
+
+                                st.markdown("#### 时间覆盖解读")
+                                st.write(
+                                    selected_time_analysis[
+                                        "interpretation"
+                                    ]
+                                )
+                            else:
+                                st.info("当前粒度没有可展示的时间分布数据。")
+
+    with exploration_tabs[3]:
         st.subheader("相关分析")
         st.caption("相关性仅表示变量共同变化关系，不代表因果关系。")
         if len(eda_numeric_columns) < 2:
@@ -6016,7 +6319,7 @@ with workbench_tabs[0]:
             correlation_pairs = calculate_correlation_pairs(df, eda_numeric_columns)
             st.dataframe(correlation_pairs, use_container_width=True, hide_index=True)
 
-    with exploration_tabs[3]:
+    with exploration_tabs[4]:
         render_module_intro(
             "sparkles",
             "AI copilot",

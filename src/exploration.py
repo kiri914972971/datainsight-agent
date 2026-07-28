@@ -666,14 +666,59 @@ def categorical_composition_table_title(category_count, display_limit=5000):
 
 
 TIME_GRANULARITIES = ("day", "week", "month", "quarter", "year")
-_TIME_GRANULARITY_LABELS = {
+TIME_GRANULARITY_LABELS = {
     "day": "日",
     "week": "周",
     "month": "月",
     "quarter": "季度",
     "year": "年",
 }
+_TIME_GRANULARITY_LABELS = TIME_GRANULARITY_LABELS
 TIME_DISTRIBUTION_MAX_POINTS = 400
+
+
+def get_time_distribution_datetime_columns(df, field_roles):
+    """Return DataFrame columns whose unified exploration role is datetime."""
+    role_by_column = field_roles.get("role_by_column", {})
+    return [
+        column
+        for column in df.columns
+        if role_by_column.get(column) == "datetime"
+    ]
+
+
+def build_time_distribution_view_data(analysis_result):
+    """Prepare existing helper output for UI rendering without recomputation."""
+    status = analysis_result.get("status")
+    known_status = status in {
+        "ok",
+        "no_valid_dates",
+        "single_date",
+        "too_dense",
+    }
+    source_rows = analysis_result.get("rows", [])
+    show_chart = (
+        status == "ok"
+        and bool(source_rows)
+        and int(analysis_result.get("period_count", 0))
+        <= TIME_DISTRIBUTION_MAX_POINTS
+    )
+    rendered_rows = [dict(item) for item in source_rows] if show_chart else []
+    return {
+        "known_status": known_status,
+        "show_chart": show_chart,
+        "show_details": show_chart,
+        "chart_rows": rendered_rows,
+        "detail_rows": [dict(item) for item in rendered_rows],
+        "zero_ranges": (
+            [
+                dict(item)
+                for item in analysis_result.get("zero_ranges", [])
+            ]
+            if show_chart
+            else []
+        ),
+    }
 
 
 def build_time_distribution_analysis(series, field_name, granularity=None):
@@ -876,18 +921,39 @@ def generate_time_distribution_interpretation(analysis_result):
     return "".join(descriptions)
 
 
-def _clean_time_distribution_dates(series):
+def parse_exploration_datetime_series(series):
+    """Parse exploration dates without imposing one format on mixed strings."""
+    source = series.copy(deep=True)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
-        parsed = pd.to_datetime(
-            series.copy(deep=True),
-            errors="coerce",
-        )
-    parsed_series = pd.Series(
+        if pd.api.types.is_datetime64_any_dtype(source.dtype):
+            parsed = pd.to_datetime(
+                source,
+                errors="coerce",
+            )
+        else:
+            try:
+                parsed = pd.to_datetime(
+                    source,
+                    errors="coerce",
+                    format="mixed",
+                )
+            except (TypeError, ValueError):
+                parsed = source.map(
+                    lambda value: pd.to_datetime(
+                        value,
+                        errors="coerce",
+                    )
+                )
+    return pd.Series(
         parsed,
         index=series.index,
         name=series.name,
     )
+
+
+def _clean_time_distribution_dates(series):
+    parsed_series = parse_exploration_datetime_series(series)
     local_days = []
     for value in parsed_series.dropna().tolist():
         timestamp = pd.Timestamp(value)
