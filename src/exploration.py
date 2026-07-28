@@ -258,6 +258,194 @@ def build_exploration_overview(df, field_roles, dataset_name=None):
     }
 
 
+def clean_finite_numeric_values(series):
+    """Return a numeric copy containing only finite values."""
+    numeric_series = pd.to_numeric(series.copy(deep=True), errors="coerce")
+    numeric_series = pd.Series(
+        numeric_series,
+        index=series.index,
+        name=series.name,
+    )
+    numeric_series = numeric_series.replace([np.inf, -np.inf], np.nan)
+    return numeric_series.dropna().astype(float)
+
+
+def classify_numeric_distribution(series):
+    """Classify finite numeric values as discrete or continuous."""
+    values = clean_finite_numeric_values(series)
+    if values.empty:
+        return "continuous"
+
+    integer_like = np.isclose(
+        values.to_numpy(dtype=float),
+        np.rint(values.to_numpy(dtype=float)),
+        rtol=0,
+        atol=1e-9,
+    ).all()
+    if integer_like and values.nunique(dropna=True) <= 30:
+        return "discrete"
+    return "continuous"
+
+
+def calculate_histogram_bin_count(series):
+    """Calculate a stable histogram bin count constrained to 10 through 50."""
+    values = clean_finite_numeric_values(series)
+    sample_count = len(values)
+    if sample_count < 2 or values.min() == values.max():
+        return 10
+
+    with np.errstate(over="ignore", invalid="ignore"):
+        value_range = float(values.max() - values.min())
+    if not np.isfinite(value_range):
+        return 50
+
+    q1, q3 = values.quantile([0.25, 0.75])
+    iqr = float(q3 - q1)
+    if iqr > 0:
+        bin_width = 2 * iqr * sample_count ** (-1 / 3)
+        if np.isfinite(bin_width) and bin_width > 0:
+            calculated_bins = int(np.ceil(value_range / bin_width))
+        else:
+            calculated_bins = 50
+    else:
+        calculated_bins = int(np.ceil(np.sqrt(sample_count)))
+
+    return max(10, min(50, calculated_bins))
+
+
+def build_discrete_numeric_frequency_table(series):
+    """Build an ascending frequency table for discrete numeric values."""
+    values = clean_finite_numeric_values(series)
+    counts = values.value_counts(sort=False).sort_index()
+    return [
+        {
+            "value": int(value) if float(value).is_integer() else float(value),
+            "count": int(count),
+        }
+        for value, count in counts.items()
+    ]
+
+
+def generate_numeric_distribution_interpretation(series, field_name):
+    """Generate a deterministic statistical description without recommendations."""
+    values = clean_finite_numeric_values(series)
+    if values.empty:
+        return "当前字段没有可用于分析的有效数值。"
+    if len(values) < 20:
+        return "当前有效样本较少，分布特征可能不稳定。"
+    if values.nunique(dropna=True) == 1:
+        return f"{field_name} 的所有有效记录取值相同，当前数据无法形成分布差异。"
+
+    if classify_numeric_distribution(values) == "discrete":
+        counts = values.value_counts().sort_values(ascending=False)
+        most_common_value = counts.index[0]
+        most_common_count = int(counts.iloc[0])
+        return (
+            f"{field_name} 为离散数值字段，有效取值范围为 "
+            f"{_plain_number(values.min())} 至 {_plain_number(values.max())}，"
+            f"最常见取值为 {_plain_number(most_common_value)}"
+            f"（{most_common_count} 条记录）。"
+            "后续进行分组比较时，可同时观察均值和中位数。"
+        )
+
+    skewness = values.skew()
+    if pd.isna(skewness):
+        return "当前分布的偏度暂不可计算。后续进行分组比较时，可同时观察均值和中位数。"
+
+    absolute_skewness = abs(float(skewness))
+    if absolute_skewness < 0.5:
+        description = f"{field_name} 的分布大致对称。"
+    elif skewness > 0:
+        degree = "存在一定右偏" if absolute_skewness < 1 else "右偏较明显"
+        description = (
+            f"{field_name} 的分布{degree}。"
+            "均值高于中位数，少数较高取值可能拉高均值。"
+        )
+    else:
+        degree = "存在一定左偏" if absolute_skewness < 1 else "左偏较明显"
+        description = (
+            f"{field_name} 的分布{degree}。"
+            "均值低于中位数，少数较低取值可能拉低均值。"
+        )
+    return description + "后续进行分组比较时，可同时观察均值和中位数。"
+
+
+def build_numeric_distribution_analysis(series, field_name):
+    """Build serializable statistics and chart data for one numeric field."""
+    values = clean_finite_numeric_values(series)
+    total_count = len(series)
+    valid_count = len(values)
+    unique_count = int(values.nunique(dropna=True))
+
+    if valid_count > 0 and unique_count == 1:
+        status = "constant"
+    elif valid_count < 5:
+        status = "insufficient_data"
+    else:
+        status = "ok"
+
+    distribution_type = classify_numeric_distribution(values)
+    summary = {
+        "mean": _finite_number(values.mean()) if valid_count else None,
+        "median": _finite_number(values.median()) if valid_count else None,
+        "std": _finite_number(values.std()) if valid_count else None,
+        "min": _finite_number(values.min()) if valid_count else None,
+        "q1": _finite_number(values.quantile(0.25)) if valid_count else None,
+        "q3": _finite_number(values.quantile(0.75)) if valid_count else None,
+        "max": _finite_number(values.max()) if valid_count else None,
+    }
+    advanced = {
+        "p10": _finite_number(values.quantile(0.10)) if valid_count else None,
+        "p25": _finite_number(values.quantile(0.25)) if valid_count else None,
+        "p50": _finite_number(values.quantile(0.50)) if valid_count else None,
+        "p75": _finite_number(values.quantile(0.75)) if valid_count else None,
+        "p90": _finite_number(values.quantile(0.90)) if valid_count else None,
+        "skew": _finite_number(values.skew()) if valid_count else None,
+        "kurtosis": _finite_number(values.kurt()) if valid_count else None,
+    }
+
+    return {
+        "status": status,
+        "field_name": str(field_name),
+        "original_dtype": str(series.dtype),
+        "total_count": int(total_count),
+        "valid_count": int(valid_count),
+        "excluded_count": int(total_count - valid_count),
+        "unique_count": unique_count,
+        "distribution_type": distribution_type,
+        "summary": summary,
+        "advanced": advanced,
+        "values": [float(value) for value in values.tolist()],
+        "discrete_table": (
+            build_discrete_numeric_frequency_table(values)
+            if distribution_type == "discrete"
+            else []
+        ),
+        "default_bin_count": (
+            calculate_histogram_bin_count(values)
+            if distribution_type == "continuous"
+            else None
+        ),
+        "interpretation": generate_numeric_distribution_interpretation(
+            values,
+            field_name,
+        ),
+    }
+
+
+def _finite_number(value):
+    if value is None or pd.isna(value) or not np.isfinite(value):
+        return None
+    return float(value)
+
+
+def _plain_number(value):
+    number = float(value)
+    if number.is_integer():
+        return f"{number:,.0f}"
+    return f"{number:,.6f}".rstrip("0").rstrip(".")
+
+
 def get_analysis_numeric_columns(df: pd.DataFrame, identifier_columns: list[str]) -> list[str]:
     identifiers = set(identifier_columns)
     return [

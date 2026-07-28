@@ -92,14 +92,13 @@ from src.data_quality import (
 from src.exploration import (
     build_exploration_field_roles,
     build_exploration_overview,
+    build_numeric_distribution_analysis,
     calculate_correlation_pairs,
     categorical_distribution_table,
     categorical_profile,
     get_analysis_categorical_columns,
     get_analysis_numeric_columns,
     interpret_categorical_distribution,
-    interpret_numeric_distribution,
-    numeric_profile,
     summarize_categorical_columns,
     summarize_numeric_columns,
 )
@@ -254,7 +253,7 @@ from src.ui import (
     render_module_intro,
     render_page_header,
 )
-from src.visualizer import box_plot, correlation_heatmap, histogram
+from src.visualizer import correlation_heatmap
 
 
 def render_outlier_visualization(
@@ -4567,6 +4566,29 @@ def _format_file_size(file_size: int) -> str:
     return f"{file_size / 1024**2:.2f} MB"
 
 
+def _format_numeric_distribution_value(value: object) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if number == 0:
+        return "0"
+
+    absolute_number = abs(number)
+    if absolute_number >= 1000:
+        decimal_places = 2
+    elif absolute_number >= 1:
+        decimal_places = 3
+    else:
+        decimal_places = 6
+    formatted = f"{number:,.{decimal_places}f}".rstrip("0").rstrip(".")
+    if formatted in {"-0", "0"}:
+        return "<0.000001" if number > 0 else ">-0.000001"
+    return formatted
+
+
 def _format_identifier_value(value: object) -> str:
     if pd.isna(value):
         return ""
@@ -5404,6 +5426,7 @@ with workbench_tabs[0]:
     except Exception as exc:
         st.error(f"探索分析基础结果生成失败：{exc}")
 
+    exploration_field_roles = None
     try:
         exploration_field_roles = build_exploration_field_roles(
             df,
@@ -5475,51 +5498,222 @@ with workbench_tabs[0]:
                 st.caption("当前没有需要排除的字段。")
 
     st.divider()
-    exploration_tabs = st.tabs(["数值分析", "类别分析", "相关分析", "AI 探索洞察"])
+    exploration_tabs = st.tabs(["数值分布", "类别分析", "相关分析", "AI 探索洞察"])
 
     with exploration_tabs[0]:
-        st.subheader("数值分析")
-        if not eda_numeric_columns:
-            st.info("当前数据没有可用于数值分析的字段。")
+        st.subheader("数值分布")
+        st.caption("用于理解单个数值字段的典型水平、波动范围和分布形态，不在此判断或处理缺失值、异常值。")
+        st.caption("本页面只做单字段统计探索，不修改当前分析数据集。")
+        numeric_distribution_columns = (
+            list(
+                exploration_field_roles.get("columns_by_role", {}).get(
+                    "numeric",
+                    [],
+                )
+            )
+            if exploration_field_roles
+            else []
+        )
+        if not numeric_distribution_columns:
+            st.info("当前数据集没有可用于数值分布分析的字段。")
         else:
+            numeric_distribution_dataset_key = str(
+                current_analysis_dataset.get("dataset_id")
+                or current_analysis_dataset.get("file_path")
+                or current_analysis_dataset.get("dataset_name")
+                or analysis_key
+            )
+            numeric_distribution_selector_key = _safe_streamlit_key(
+                "numeric_distribution_field_"
+                f"{active_project_id}_{numeric_distribution_dataset_key}"
+            )
+            if (
+                st.session_state.get(numeric_distribution_selector_key)
+                not in numeric_distribution_columns
+            ):
+                st.session_state[numeric_distribution_selector_key] = (
+                    numeric_distribution_columns[0]
+                )
             selected_numeric = st.selectbox(
                 "选择数值字段",
-                eda_numeric_columns,
-                key="exploration_numeric_column",
+                numeric_distribution_columns,
+                key=numeric_distribution_selector_key,
             )
-            st.markdown("#### 数值字段总览")
-            st.dataframe(
-                summarize_numeric_columns(df, eda_numeric_columns),
-                use_container_width=True,
-                hide_index=True,
-            )
+            try:
+                numeric_distribution = build_numeric_distribution_analysis(
+                    df[selected_numeric],
+                    selected_numeric,
+                )
+            except Exception as exc:
+                st.error(f"数值分布分析失败：{exc}")
+            else:
+                st.markdown("#### 字段基础信息")
+                field_info_columns = st.columns(4)
+                field_info_columns[0].metric("字段名称", numeric_distribution["field_name"])
+                field_info_columns[1].metric("原始数据类型", numeric_distribution["original_dtype"])
+                field_info_columns[2].metric(
+                    "有效数值记录数",
+                    f"{numeric_distribution['valid_count']:,}",
+                )
+                field_info_columns[3].metric(
+                    "总记录数",
+                    f"{numeric_distribution['total_count']:,}",
+                )
+                if numeric_distribution["excluded_count"] > 0:
+                    st.caption(
+                        f"本次分布分析使用 {numeric_distribution['valid_count']:,} 条有效数值记录，"
+                        f"另有 {numeric_distribution['excluded_count']:,} 条记录未参与。"
+                        "缺失和异常处理请前往【数据质量】。"
+                    )
 
-            st.markdown(f"#### {selected_numeric} 数值画像")
-            selected_numeric_profile = numeric_profile(df, selected_numeric)
-            numeric_cards = st.columns(5)
-            numeric_cards[0].metric("均值", f"{selected_numeric_profile['均值']:.3f}")
-            numeric_cards[1].metric("中位数", f"{selected_numeric_profile['中位数']:.3f}")
-            numeric_cards[2].metric("标准差", f"{selected_numeric_profile['标准差']:.3f}")
-            numeric_cards[3].metric("最小值", f"{selected_numeric_profile['最小值']:.3f}")
-            numeric_cards[4].metric("最大值", f"{selected_numeric_profile['最大值']:.3f}")
-            numeric_cards = st.columns(4)
-            numeric_cards[0].metric("偏度", f"{selected_numeric_profile['偏度']:.3f}")
-            numeric_cards[1].metric("峰度", f"{selected_numeric_profile['峰度']:.3f}")
-            numeric_cards[2].metric("缺失率", f"{selected_numeric_profile['缺失率']:.2f}%")
-            numeric_cards[3].metric("异常值比例", f"{selected_numeric_profile['异常值比例']:.2f}%")
-            st.info(interpret_numeric_distribution(df[selected_numeric]))
+                st.markdown("#### 核心统计")
+                numeric_summary = numeric_distribution["summary"]
+                primary_stat_cards = st.columns(4)
+                primary_stat_cards[0].metric(
+                    "有效记录数",
+                    f"{numeric_distribution['valid_count']:,}",
+                )
+                primary_stat_cards[1].metric(
+                    "均值",
+                    _format_numeric_distribution_value(numeric_summary["mean"]),
+                )
+                primary_stat_cards[2].metric(
+                    "中位数",
+                    _format_numeric_distribution_value(numeric_summary["median"]),
+                )
+                primary_stat_cards[3].metric(
+                    "标准差",
+                    _format_numeric_distribution_value(numeric_summary["std"]),
+                )
+                range_stat_cards = st.columns(4)
+                range_stat_cards[0].metric(
+                    "最小值",
+                    _format_numeric_distribution_value(numeric_summary["min"]),
+                )
+                range_stat_cards[1].metric(
+                    "下四分位数（Q1）",
+                    _format_numeric_distribution_value(numeric_summary["q1"]),
+                )
+                range_stat_cards[2].metric(
+                    "上四分位数（Q3）",
+                    _format_numeric_distribution_value(numeric_summary["q3"]),
+                )
+                range_stat_cards[3].metric(
+                    "最大值",
+                    _format_numeric_distribution_value(numeric_summary["max"]),
+                )
 
-            numeric_charts = st.columns(2)
-            numeric_charts[0].plotly_chart(
-                histogram(df, selected_numeric),
-                use_container_width=True,
-                key="exploration_numeric_histogram",
-            )
-            numeric_charts[1].plotly_chart(
-                box_plot(df, selected_numeric),
-                use_container_width=True,
-                key="exploration_numeric_box",
-            )
+                if numeric_distribution["status"] == "constant":
+                    st.info("该字段只有一个有效取值，无法形成数值分布。")
+                elif numeric_distribution["status"] == "insufficient_data":
+                    st.info("有效记录少于 5 条，暂不生成分布图。")
+                elif numeric_distribution["distribution_type"] == "discrete":
+                    st.caption("该字段取值种类较少，请确认其表示可计算数量，而不是类别编码。")
+                    discrete_chart_data = pd.DataFrame(
+                        {
+                            "取值": [
+                                str(item["value"])
+                                for item in numeric_distribution["discrete_table"]
+                            ],
+                            "记录数": [
+                                item["count"]
+                                for item in numeric_distribution["discrete_table"]
+                            ],
+                        }
+                    )
+                    st.plotly_chart(
+                        px.bar(
+                            discrete_chart_data,
+                            x="取值",
+                            y="记录数",
+                            title=f"{selected_numeric} 数值分布",
+                        ),
+                        use_container_width=True,
+                        key=_safe_streamlit_key(
+                            "numeric_distribution_discrete_chart_"
+                            f"{active_project_id}_{numeric_distribution_dataset_key}_{selected_numeric}"
+                        ),
+                    )
+                else:
+                    histogram_bin_count = numeric_distribution["default_bin_count"]
+                    if numeric_distribution["valid_count"] >= 20:
+                        histogram_bin_count = st.slider(
+                            "分箱数量",
+                            min_value=10,
+                            max_value=50,
+                            value=histogram_bin_count,
+                            key=_safe_streamlit_key(
+                                "numeric_distribution_bins_"
+                                f"{active_project_id}_{numeric_distribution_dataset_key}_{selected_numeric}"
+                            ),
+                        )
+                    histogram_data = pd.DataFrame(
+                        {
+                            selected_numeric: numeric_distribution["values"],
+                        }
+                    )
+                    histogram_figure = px.histogram(
+                        histogram_data,
+                        x=selected_numeric,
+                        nbins=histogram_bin_count,
+                        title=f"{selected_numeric} 数值分布",
+                    )
+                    histogram_figure.update_layout(
+                        yaxis_title="记录数",
+                        xaxis_tickformat=",.6~f",
+                    )
+                    histogram_figure.update_traces(
+                        hovertemplate=(
+                            f"{selected_numeric}: %{{x:,.6f}}<br>"
+                            "记录数: %{y:,}<extra></extra>"
+                        )
+                    )
+                    st.plotly_chart(
+                        histogram_figure,
+                        use_container_width=True,
+                        key=_safe_streamlit_key(
+                            "numeric_distribution_histogram_"
+                            f"{active_project_id}_{numeric_distribution_dataset_key}_{selected_numeric}"
+                        ),
+                    )
+
+                st.markdown("#### 分布解读")
+                st.write(numeric_distribution["interpretation"])
+
+                with st.expander("查看高级统计详情", expanded=False):
+                    st.caption(
+                        "百分位数表示不高于该数值的记录比例。"
+                        "例如，P90 表示约 90% 的有效记录不高于该值。"
+                    )
+                    advanced_labels = [
+                        ("第10百分位数（P10）", "p10"),
+                        ("下四分位数（P25 / Q1）", "p25"),
+                        ("中位数（P50 / Q2）", "p50"),
+                        ("上四分位数（P75 / Q3）", "p75"),
+                        ("第90百分位数（P90）", "p90"),
+                        ("偏度", "skew"),
+                        ("峰度", "kurtosis"),
+                    ]
+                    st.dataframe(
+                        pd.DataFrame(
+                            [
+                                {
+                                    "统计项": label,
+                                    "数值": _format_numeric_distribution_value(
+                                        numeric_distribution["advanced"][key]
+                                    ),
+                                }
+                                for label, key in advanced_labels
+                            ]
+                        ),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    st.caption(
+                        "偏度用于描述分布是否向一侧拖尾；"
+                        "峰度用于描述分布相对集中或平缓的程度。"
+                        "两者仅用于辅助理解分布，不代表异常值或业务风险。"
+                    )
 
     with exploration_tabs[1]:
         st.subheader("类别分析")
