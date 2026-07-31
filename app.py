@@ -5653,6 +5653,11 @@ with workbench_tabs[0]:
                                 f"{active_project_id}_{numeric_distribution_dataset_key}_{selected_numeric}"
                             ),
                         )
+                        st.caption(
+                            "分箱是将连续数值范围划分为若干区间，并统计每个区间内的记录数。"
+                            "分箱越多，图表越细；分箱越少，图表越概括。"
+                            "该设置只影响图表展示，不影响统计结果。"
+                        )
                     histogram_data = pd.DataFrame(
                         {
                             selected_numeric: numeric_distribution["values"],
