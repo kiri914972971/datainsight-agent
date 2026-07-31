@@ -120,6 +120,40 @@ def test_native_datetime_series_uses_safe_datetime_parsing():
     assert result["end_date"] == "2020-06-30"
 
 
+def test_numeric_year_series_is_not_parsed_as_unix_nanoseconds():
+    series = pd.Series([2020, 2020], name="成交年份")
+
+    parsed = parse_exploration_datetime_series(series)
+    result = build_time_distribution_analysis(series, "成交年份")
+
+    assert parsed.isna().all()
+    assert result["status"] == "no_valid_dates"
+    assert result["valid_count"] == 0
+    assert result["start_date"] is None
+    assert result["end_date"] is None
+
+
+def test_numeric_month_series_is_not_parsed_as_unix_nanoseconds():
+    series = pd.Series([4, 5, 6], name="成交月份")
+
+    parsed = parse_exploration_datetime_series(series)
+    result = build_time_distribution_analysis(series, "成交月份")
+
+    assert parsed.isna().all()
+    assert result["status"] == "no_valid_dates"
+    assert result["excluded_count"] == 3
+    assert result["start_date"] is None
+    assert result["end_date"] is None
+
+
+def test_float_numeric_series_is_not_parsed_as_datetime():
+    series = pd.Series([2020.0, 2021.0], name="数值日期")
+
+    parsed = parse_exploration_datetime_series(series)
+
+    assert parsed.isna().all()
+
+
 def test_datetime_parser_does_not_modify_input_series():
     series = pd.Series(
         ["2020-04-01 00:00:00", "2020-06-01", "not-a-date"],

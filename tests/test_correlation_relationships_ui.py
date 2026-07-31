@@ -11,7 +11,7 @@ CORRELATION_TAB_SOURCE = APP_SOURCE.split(
     "with exploration_tabs[3]:",
     maxsplit=1,
 )[1].split(
-    "with exploration_tabs[4]:",
+    "with workbench_tabs[1]:",
     maxsplit=1,
 )[0]
 
@@ -23,7 +23,7 @@ def test_correlation_tab_is_renamed():
 
 def test_exploration_tab_order_is_correct():
     assert (
-        '["数值分布", "类别构成", "时间分布", "相关关系", "AI 探索洞察"]'
+        '["数值分布", "类别构成", "时间分布", "相关关系"]'
         in NORMALIZED_APP_SOURCE
     )
 
@@ -357,8 +357,8 @@ def test_legacy_calculate_correlation_pairs_still_behaves_the_same():
 
 
 def test_exploration_tab_indexes_remain_aligned():
-    assert APP_SOURCE.count("with exploration_tabs[") == 5
-    for index in range(5):
+    assert APP_SOURCE.count("with exploration_tabs[") == 4
+    for index in range(4):
         assert f"with exploration_tabs[{index}]:" in APP_SOURCE
 
 
@@ -374,6 +374,6 @@ def test_numeric_category_and_time_tabs_remain_before_relationships():
     )
 
 
-def test_ai_exploration_tab_remains_accessible():
-    assert "with exploration_tabs[4]:" in APP_SOURCE
-    assert '"AI 探索洞察"' in APP_SOURCE
+def test_removed_ai_exploration_tab_is_not_accessible():
+    assert "with exploration_tabs[4]:" not in APP_SOURCE
+    assert '"AI 探索洞察"' not in APP_SOURCE

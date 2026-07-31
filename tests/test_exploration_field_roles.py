@@ -90,6 +90,49 @@ def test_chinese_derived_time_columns_are_recognized():
     assert result["role_by_column"]["签约月"] == "derived_time"
 
 
+def test_derived_time_overrides_automatic_datetime_detection():
+    df = pd.DataFrame(
+        {
+            "成交日期": ["2020-04-01", "2020-06-30"],
+            "成交年份": [2020, 2020],
+            "成交月份": [4, 6],
+            "created_year": [2020, 2020],
+            "order_month": [4, 6],
+            "quarter": [2, 2],
+            "weekday": [3, 2],
+        }
+    )
+
+    result = build_exploration_field_roles(
+        df,
+        datetime_columns=list(df.columns),
+    )
+
+    assert result["role_by_column"]["成交日期"] == "datetime"
+    for column in (
+        "成交年份",
+        "成交月份",
+        "created_year",
+        "order_month",
+        "quarter",
+        "weekday",
+    ):
+        assert result["role_by_column"][column] == "derived_time"
+
+
+def test_confirmed_datetime_role_overrides_derived_time_name():
+    df = pd.DataFrame({"成交年份": [2020, 2021]})
+
+    role = _role_for(
+        df,
+        "成交年份",
+        datetime_columns=["成交年份"],
+        confirmed_type_by_column={"成交年份": "日期字段"},
+    )
+
+    assert role == "datetime"
+
+
 def test_derived_time_helper_supports_common_english_names():
     series = pd.Series([1, 2])
 

@@ -6,7 +6,7 @@ CORRELATION_TAB_SOURCE = APP_SOURCE.split(
     "with exploration_tabs[3]:",
     maxsplit=1,
 )[1].split(
-    "with exploration_tabs[4]:",
+    "with workbench_tabs[1]:",
     maxsplit=1,
 )[0]
 SCATTER_SOURCE = CORRELATION_TAB_SOURCE.split(

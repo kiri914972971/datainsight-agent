@@ -5,6 +5,7 @@ import pandas as pd
 from src.exploration import (
     build_exploration_field_roles,
     build_exploration_overview,
+    get_time_distribution_datetime_columns,
 )
 
 
@@ -70,6 +71,49 @@ def test_derived_time_is_not_counted_as_datetime():
 
     assert overview["datetime_count"] == 0
     assert overview["numeric_count"] == 0
+
+
+def test_automatic_datetime_candidates_use_final_derived_time_roles():
+    df = pd.DataFrame(
+        {
+            "成交日期": ["2020-04-01", "2020-06-30"],
+            "成交年份": [2020, 2020],
+            "成交月份": [4, 6],
+        }
+    )
+    field_roles = build_exploration_field_roles(
+        df,
+        datetime_columns=["成交日期", "成交年份", "成交月份"],
+    )
+
+    overview = build_exploration_overview(
+        df,
+        field_roles,
+        "sales.csv",
+    )
+    excluded_by_column = {
+        item["column"]: item
+        for item in overview["excluded_fields"]
+    }
+
+    assert overview["datetime_count"] == 1
+    assert overview["datetime_summary"]["mode"] == "single"
+    assert overview["datetime_summary"]["column"] == "成交日期"
+    assert overview["datetime_summary"]["start_date"] == "2020-04-01"
+    assert overview["datetime_summary"]["end_date"] == "2020-06-30"
+    assert get_time_distribution_datetime_columns(df, field_roles) == [
+        "成交日期"
+    ]
+    assert excluded_by_column["成交年份"] == {
+        "column": "成交年份",
+        "role": "derived_time",
+        "reason": "时间派生字段",
+    }
+    assert excluded_by_column["成交月份"] == {
+        "column": "成交月份",
+        "role": "derived_time",
+        "reason": "时间派生字段",
+    }
 
 
 def test_identifier_is_not_counted_as_numeric():

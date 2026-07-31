@@ -5,10 +5,12 @@ import pandas as pd
 from src.exploration import (
     TIME_GRANULARITIES,
     TIME_GRANULARITY_LABELS,
+    build_exploration_field_roles,
     build_time_distribution_analysis,
     build_time_distribution_view_data,
     calculate_dataframe_height,
     get_time_distribution_datetime_columns,
+    resolve_time_distribution_datetime_selection,
 )
 
 
@@ -25,7 +27,7 @@ TIME_TAB_SOURCE = APP_SOURCE.split(
 
 def test_exploration_tab_order_contains_time_distribution():
     assert (
-        '["数值分布", "类别构成", "时间分布", "相关关系", "AI 探索洞察"]'
+        '["数值分布", "类别构成", "时间分布", "相关关系"]'
         in NORMALIZED_APP_SOURCE
     )
 
@@ -38,13 +40,10 @@ def test_date_selector_uses_only_datetime_role():
             "产品": ["A"],
         }
     )
-    field_roles = {
-        "role_by_column": {
-            "成交日期": "datetime",
-            "成交金额": "numeric",
-            "产品": "categorical",
-        }
-    }
+    field_roles = build_exploration_field_roles(
+        df,
+        datetime_columns=["成交日期"],
+    )
 
     assert get_time_distribution_datetime_columns(df, field_roles) == [
         "成交日期"
@@ -59,13 +58,10 @@ def test_derived_time_is_not_in_date_selector():
             "成交月份": [1],
         }
     )
-    field_roles = {
-        "role_by_column": {
-            "成交日期": "datetime",
-            "成交年份": "derived_time",
-            "成交月份": "derived_time",
-        }
-    }
+    field_roles = build_exploration_field_roles(
+        df,
+        datetime_columns=["成交日期", "成交年份", "成交月份"],
+    )
 
     assert get_time_distribution_datetime_columns(df, field_roles) == [
         "成交日期"
@@ -74,10 +70,53 @@ def test_derived_time_is_not_in_date_selector():
 
 def test_no_datetime_fields_returns_empty_list_and_has_empty_message():
     df = pd.DataFrame({"成交金额": [100]})
-    field_roles = {"role_by_column": {"成交金额": "numeric"}}
+    field_roles = build_exploration_field_roles(df)
 
     assert get_time_distribution_datetime_columns(df, field_roles) == []
     assert "当前数据集没有可用于时间分布分析的完整日期字段。" in TIME_TAB_SOURCE
+
+
+def test_year_session_state_falls_back_to_complete_date():
+    assert resolve_time_distribution_datetime_selection(
+        ["成交日期"],
+        "成交年份",
+    ) == "成交日期"
+
+
+def test_month_session_state_falls_back_to_complete_date():
+    assert resolve_time_distribution_datetime_selection(
+        ["成交日期"],
+        "成交月份",
+    ) == "成交日期"
+
+
+def test_valid_session_state_selection_is_preserved():
+    assert resolve_time_distribution_datetime_selection(
+        ["成交日期", "创建日期"],
+        "创建日期",
+    ) == "创建日期"
+
+
+def test_empty_datetime_options_have_safe_selection():
+    assert resolve_time_distribution_datetime_selection([], "成交年份") is None
+
+
+def test_time_options_helper_uses_final_columns_by_role():
+    assert 'get("columns_by_role", {}).get("datetime", [])' in Path(
+        "src/exploration.py"
+    ).read_text(encoding="utf-8")
+
+
+def test_automatic_mapping_types_are_not_treated_as_manual_overrides():
+    mapping_source = APP_SOURCE.split(
+        "confirmed_type_by_column =",
+        maxsplit=1,
+    )[1].split(
+        "automatically_detected_identifiers =",
+        maxsplit=1,
+    )[0]
+
+    assert 'item.get("confirmed_type") != item.get("inferred_type")' in mapping_source
 
 
 def test_selected_date_field_is_used_to_access_dataframe_series():
@@ -209,10 +248,10 @@ def test_numeric_and_category_tab_indexes_are_unchanged():
     assert "with exploration_tabs[1]:" in APP_SOURCE
 
 
-def test_correlation_and_ai_tabs_shift_to_valid_indexes():
+def test_correlation_tab_uses_final_valid_index():
     assert "with exploration_tabs[3]:" in APP_SOURCE
-    assert "with exploration_tabs[4]:" in APP_SOURCE
-    assert APP_SOURCE.count("with exploration_tabs[") == 5
+    assert "with exploration_tabs[4]:" not in APP_SOURCE
+    assert APP_SOURCE.count("with exploration_tabs[") == 4
 
 
 def test_time_page_copy_has_no_out_of_scope_terms():

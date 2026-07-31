@@ -141,12 +141,12 @@ def build_exploration_field_roles(
                     unsupported_reason = "人工确认排除字段"
             elif column in identifier_columns:
                 role = "identifier"
+            elif is_derived_time_column(column, series):
+                role = "derived_time"
             elif column in datetime_columns or pd.api.types.is_datetime64_any_dtype(
                 series.dtype
             ):
                 role = "datetime"
-            elif is_derived_time_column(column, series):
-                role = "derived_time"
             elif series.nunique(dropna=True) == 1:
                 role = "constant"
             elif pd.api.types.is_bool_dtype(series.dtype):
@@ -212,12 +212,9 @@ def build_exploration_overview(df, field_roles, dataset_name=None):
         datetime_summary["mode"] = "single"
         datetime_summary["column"] = datetime_column
         try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", UserWarning)
-                parsed_dates = pd.to_datetime(
-                    df[datetime_column],
-                    errors="coerce",
-                ).dropna()
+            parsed_dates = parse_exploration_datetime_series(
+                df[datetime_column]
+            ).dropna()
             if not parsed_dates.empty:
                 datetime_summary["start_date"] = parsed_dates.min().strftime("%Y-%m-%d")
                 datetime_summary["end_date"] = parsed_dates.max().strftime("%Y-%m-%d")
@@ -680,11 +677,42 @@ TIME_DISTRIBUTION_MAX_POINTS = 400
 def get_time_distribution_datetime_columns(df, field_roles):
     """Return DataFrame columns whose unified exploration role is datetime."""
     role_by_column = field_roles.get("role_by_column", {})
-    return [
-        column
-        for column in df.columns
-        if role_by_column.get(column) == "datetime"
-    ]
+    datetime_columns = set(
+        field_roles.get("columns_by_role", {}).get("datetime", [])
+    )
+    options = []
+    for column in df.columns:
+        if (
+            column not in datetime_columns
+            or role_by_column.get(column) != "datetime"
+            or is_derived_time_column(column, df[column])
+        ):
+            continue
+        dtype = df[column].dtype
+        if (
+            pd.api.types.is_numeric_dtype(dtype)
+            and not pd.api.types.is_datetime64_any_dtype(dtype)
+        ):
+            continue
+        if not (
+            pd.api.types.is_datetime64_any_dtype(dtype)
+            or pd.api.types.is_object_dtype(dtype)
+            or pd.api.types.is_string_dtype(dtype)
+        ):
+            continue
+        options.append(column)
+    return options
+
+
+def resolve_time_distribution_datetime_selection(
+    datetime_columns,
+    current_selection,
+):
+    """Keep a valid datetime selection or fall back to the first option."""
+    options = list(datetime_columns or [])
+    if current_selection in options:
+        return current_selection
+    return options[0] if options else None
 
 
 def build_time_distribution_view_data(analysis_result):
@@ -930,6 +958,13 @@ def parse_exploration_datetime_series(series):
             parsed = pd.to_datetime(
                 source,
                 errors="coerce",
+            )
+        elif pd.api.types.is_numeric_dtype(source.dtype):
+            parsed = pd.Series(
+                pd.NaT,
+                index=source.index,
+                name=source.name,
+                dtype="datetime64[ns]",
             )
         else:
             try:

@@ -8,10 +8,6 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from src.eda_ai_complete import (
-    build_analysis_payload,
-    request_ai_insights,
-)
 from src.ai_connection import test_ai_connection
 from src.ai_presets import AI_MODEL_PRESETS
 from src.business_analysis import (
@@ -106,6 +102,7 @@ from src.exploration import (
     get_analysis_categorical_columns,
     get_analysis_numeric_columns,
     get_time_distribution_datetime_columns,
+    resolve_time_distribution_datetime_selection,
     summarize_categorical_columns,
     summarize_numeric_columns,
     TIME_GRANULARITIES,
@@ -262,9 +259,6 @@ from src.ui import (
     render_module_intro,
     render_page_header,
 )
-from src.visualizer import correlation_heatmap
-
-
 def render_outlier_visualization(
     df: pd.DataFrame,
     column: str,
@@ -4922,6 +4916,7 @@ confirmed_type_by_column = {
     item["column_name"]: item.get("confirmed_type")
     for item in saved_field_mappings
     if item.get("column_name") in df.columns
+    and item.get("confirmed_type") != item.get("inferred_type")
 }
 automatically_detected_identifiers = detect_identifier_columns(
     df,
@@ -5508,7 +5503,7 @@ with workbench_tabs[0]:
 
     st.divider()
     exploration_tabs = st.tabs(
-        ["数值分布", "类别构成", "时间分布", "相关关系", "AI 探索洞察"]
+        ["数值分布", "类别构成", "时间分布", "相关关系"]
     )
 
     with exploration_tabs[0]:
@@ -5723,14 +5718,15 @@ with workbench_tabs[0]:
                     st.caption(
                         "偏度用于描述分布是否向一侧拖尾；"
                         "峰度用于描述分布相对集中或平缓的程度。"
-                        "两者仅用于辅助理解分布，不代表异常值或业务风险。"
+                        "两者仅用于辅助理解分布，不代表异常值，"
+                        "也不用于判断是否需要处理。"
                     )
 
     with exploration_tabs[1]:
         st.subheader("类别构成")
         st.caption(
             "用于查看单个类别字段中各类别的记录数、记录数占比和长尾结构。"
-            "此处的记录分布不代表成交金额、销量或业务贡献。"
+            "此处的记录分布不代表成交金额、销量或其他业务指标。"
         )
         st.caption(
             "本页面只做统计探索，不修改当前分析数据集，不执行数据清洗，"
@@ -6015,7 +6011,7 @@ with workbench_tabs[0]:
         st.caption(
             "用于查看日期字段的数据覆盖范围和各时间段的记录数分布。"
             "此处展示的是当前分析数据集的记录数量，"
-            "不代表成交金额、订单量或业务表现。"
+            "不代表成交金额或其他业务指标。"
         )
         st.caption(
             "无记录时间段不一定表示数据缺失，也可能是当时没有业务活动，"
@@ -6038,17 +6034,25 @@ with workbench_tabs[0]:
                 "time_distribution_field_"
                 f"{active_project_id}_{time_distribution_dataset_key}"
             )
+            resolved_time_field = (
+                resolve_time_distribution_datetime_selection(
+                    time_distribution_columns,
+                    st.session_state.get(time_field_selector_key),
+                )
+            )
             if (
                 st.session_state.get(time_field_selector_key)
-                not in time_distribution_columns
+                != resolved_time_field
             ):
-                st.session_state.pop(time_field_selector_key, None)
+                st.session_state[time_field_selector_key] = resolved_time_field
             selected_time_field = st.selectbox(
                 "选择日期字段",
                 time_distribution_columns,
                 index=0,
                 key=time_field_selector_key,
             )
+            if selected_time_field not in time_distribution_columns:
+                selected_time_field = time_distribution_columns[0]
 
             try:
                 recommended_time_analysis = build_time_distribution_analysis(
@@ -6842,37 +6846,6 @@ with workbench_tabs[0]:
                                     "该字段对接近完全相关，可能存在重复字段、"
                                     "单位转换或直接计算关系，请检查字段定义。"
                                 )
-
-    with exploration_tabs[4]:
-        render_module_intro(
-            "sparkles",
-            "AI copilot",
-            "AI 探索洞察",
-            "基于探索结果提炼关键发现、业务含义与下一步分析问题，不重复数据质量内容。",
-        )
-        st.subheader("AI 探索洞察")
-        st.caption("AI 仅基于数值统计、类别统计和相关分析生成洞察，不重复数据质量内容。")
-        if not api_key:
-            st.info("在左侧填写 API Key 后，可生成关键发现、业务含义和建议进一步分析的问题。")
-        if st.button("生成 AI 探索洞察", disabled=not api_key, type="primary"):
-            try:
-                with st.spinner("AI 正在分析探索结果..."):
-                    payload = build_analysis_payload(df, eda_numeric_columns, eda_category_columns)
-                    st.session_state.ai_exploration_result = request_ai_insights(payload, api_key, ai_model, ai_base_url)
-                st.session_state.ai_connection_status = {
-                    "signature": ai_config_signature,
-                    "success": True,
-                    "message": "接入成功，AI 探索洞察已生成。",
-                }
-            except Exception as exc:
-                st.session_state.ai_connection_status = {
-                    "signature": ai_config_signature,
-                    "success": False,
-                    "message": f"接入失败：{exc}",
-                }
-                st.error(f"AI 探索洞察生成失败：{exc}")
-        if st.session_state.get("ai_exploration_result"):
-            st.markdown(st.session_state.ai_exploration_result)
 
 with workbench_tabs[1]:
     render_dashboard_tab(active_project_id)
