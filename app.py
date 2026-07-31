@@ -5968,29 +5968,35 @@ with workbench_tabs[0]:
                             ),
                         )
 
-                        if categorical_chart_data["has_other"]:
+                        if (
+                            categorical_chart_data["has_other"]
+                            and categorical_chart_data["other_rows"]
+                        ):
+                            other_category_table = pd.DataFrame(
+                                [
+                                    {
+                                        "类别": item["category"],
+                                        "记录数": item["count"],
+                                        "记录数占比": (
+                                            f"{item['ratio'] * 100:.2f}%"
+                                        ),
+                                    }
+                                    for item in categorical_chart_data[
+                                        "other_rows"
+                                    ]
+                                ]
+                            )
                             with st.expander(
                                 "查看‘其他’包含的类别",
                                 expanded=False,
                             ):
                                 st.dataframe(
-                                    pd.DataFrame(
-                                        [
-                                            {
-                                                "类别": item["category"],
-                                                "记录数": item["count"],
-                                                "记录数占比": (
-                                                    f"{item['ratio'] * 100:.2f}%"
-                                                ),
-                                            }
-                                            for item in categorical_chart_data[
-                                                "other_rows"
-                                            ]
-                                        ]
-                                    ),
+                                    other_category_table,
                                     use_container_width=True,
                                     hide_index=True,
-                                    height=400,
+                                    height=calculate_dataframe_height(
+                                        len(other_category_table)
+                                    ),
                                 )
 
                         st.markdown("#### 构成解读")
