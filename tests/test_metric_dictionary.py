@@ -6,6 +6,7 @@ from unittest.mock import patch
 from src import project_workspace
 from src.engines.metric_dictionary_engine import generate_metric_candidates_from_kpis
 from src.services.kpi_service import save_kpi_definitions
+from src.services.field_mapping_service import save_field_mappings
 from src.services.metric_dictionary_service import (
     add_metric_definition,
     delete_metric_definition,
@@ -65,6 +66,15 @@ class MetricDictionaryEngineTests(unittest.TestCase):
         self.assertIn("成交金额", by_name["销售额"]["aliases"])
         self.assertEqual(by_name["同比"]["metric_type"], "时间指标")
         self.assertFalse(by_name["同比"]["enabled"])
+
+    def test_explicit_unsaved_candidate_is_not_a_metric_candidate_source(self):
+        candidate = {
+            **self.kpis[0],
+            "lifecycle_status": "candidate",
+            "enabled": False,
+        }
+
+        self.assertEqual(generate_metric_candidates_from_kpis([candidate]), [])
 
 
 class MetricDictionaryServiceTests(unittest.TestCase):
@@ -158,6 +168,59 @@ class MetricDictionaryServiceTests(unittest.TestCase):
 
         delete_metric_definition(self.project["project_id"], metric["metric_id"])
         self.assertEqual(get_metric_dictionary(self.project["project_id"]), [])
+
+    def test_unsaved_kpi_candidates_do_not_generate_metric_candidates(self):
+        project = project_workspace.create_project("Unsaved KPI Metric Project")
+        save_field_mappings(
+            project["project_id"],
+            [{"column_name": "成交金额", "confirmed_type": "金额字段"}],
+        )
+
+        candidates = generate_project_metric_candidates(project["project_id"])
+
+        self.assertEqual(candidates, [])
+
+    def test_disabled_saved_kpi_still_generates_metric_candidate(self):
+        save_kpi_definitions(
+            self.project["project_id"],
+            [
+                {
+                    "kpi_id": "disabled-saved",
+                    "kpi_name": "禁用销售额",
+                    "aggregation": "sum",
+                    "source_field": "成交金额",
+                    "field_type": "amount",
+                    "category": "核心指标",
+                    "enabled": False,
+                    "lifecycle_status": "saved",
+                }
+            ],
+        )
+
+        candidates = generate_project_metric_candidates(self.project["project_id"])
+
+        self.assertEqual([item["metric_name"] for item in candidates], ["禁用销售额"])
+        self.assertFalse(candidates[0]["enabled"])
+
+    def test_saved_metric_definitions_remain_when_linked_kpis_are_removed(self):
+        save_metric_dictionary(
+            self.project["project_id"],
+            [
+                {
+                    "metric_name": "历史销售额",
+                    "linked_kpi_id": "missing-kpi",
+                    "linked_kpi_name": "已删除 KPI",
+                    "enabled": True,
+                }
+            ],
+        )
+        save_kpi_definitions(self.project["project_id"], [])
+
+        loaded = load_metric_dictionary(self.project["project_id"])
+
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0]["metric_name"], "历史销售额")
+        self.assertEqual(generate_project_metric_candidates(self.project["project_id"]), [])
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -61,12 +62,14 @@ def load_kpi_definitions(project_id: str) -> list[dict[str, Any]]:
 def save_kpi_definitions(
     project_id: str,
     kpis: list[dict[str, Any]],
+    available_fields: list[str] | tuple[str, ...] | set[str] | None = None,
 ) -> list[dict[str, Any]]:
     field_mappings = _load_validation_field_mappings(project_id)
     normalized = [
         _normalize_with_timestamp(
             item,
             lifecycle_status="saved",
+            available_fields=available_fields,
             field_mappings=field_mappings,
         )
         for item in kpis or []
@@ -115,6 +118,217 @@ def list_usable_kpis(
         ):
             usable_kpis.append(normalized)
     return usable_kpis
+
+
+def list_unsaved_kpi_candidates(project_id: str) -> list[dict[str, Any]]:
+    """Return generated candidates that are not already persisted KPIs."""
+    return filter_unsaved_kpi_candidates(
+        load_kpi_definitions(project_id),
+        generate_project_kpi_candidates(project_id),
+    )
+
+
+def filter_unsaved_kpi_candidates(
+    saved_kpis: list[dict[str, Any]] | None,
+    candidates: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Filter candidate rows without mutating or persisting either input."""
+    saved_ids = {
+        str(item.get("kpi_id", ""))
+        for item in saved_kpis or []
+        if isinstance(item, dict) and item.get("kpi_id")
+    }
+    saved_keys = {
+        _kpi_identity(item)
+        for item in saved_kpis or []
+        if isinstance(item, dict)
+    }
+    result = []
+    seen_ids = set()
+    seen_keys = set()
+    for candidate in candidates or []:
+        if not isinstance(candidate, dict):
+            continue
+        candidate_id = str(candidate.get("kpi_id", ""))
+        candidate_key = _kpi_identity(candidate)
+        if (
+            candidate_id in saved_ids
+            or candidate_key in saved_keys
+            or candidate_id in seen_ids
+            or candidate_key in seen_keys
+        ):
+            continue
+        result.append(dict(candidate))
+        seen_ids.add(candidate_id)
+        seen_keys.add(candidate_key)
+    return result
+
+
+def kpi_collection_signature(kpis: list[dict[str, Any]] | None) -> str:
+    """Build a stable signature for project-scoped editor state keys."""
+    payload = [
+        {
+            "kpi_id": str(item.get("kpi_id", "")),
+            "kpi_name": str(item.get("kpi_name", "")),
+            "aggregation": str(item.get("aggregation", "")),
+            "source_field": str(item.get("source_field", "")),
+            "field_type": str(item.get("field_type", "")),
+            "category": str(item.get("category", "")),
+            "description": str(item.get("description", "")),
+            "enabled": bool(item.get("enabled", False)),
+            "lifecycle_status": str(item.get("lifecycle_status", "")),
+            "validation_status": str(item.get("validation_status", "")),
+            "validation_messages": [
+                str(message)
+                for message in item.get("validation_messages", []) or []
+            ],
+        }
+        for item in kpis or []
+        if isinstance(item, dict)
+    ]
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def summarize_kpi_center(
+    saved_kpis: list[dict[str, Any]] | None,
+    candidate_kpis: list[dict[str, Any]] | None,
+    usable_kpis: list[dict[str, Any]] | None,
+) -> dict[str, int]:
+    saved = [item for item in saved_kpis or [] if isinstance(item, dict)]
+    return {
+        "candidate_count": len(
+            [item for item in candidate_kpis or [] if isinstance(item, dict)]
+        ),
+        "saved_count": len(saved),
+        "enabled_count": len([item for item in saved if item.get("enabled")]),
+        "usable_count": len(
+            [item for item in usable_kpis or [] if isinstance(item, dict)]
+        ),
+        "invalid_count": len(
+            [
+                item
+                for item in saved
+                if item.get("validation_status") == "invalid"
+            ]
+        ),
+    }
+
+
+def save_selected_kpi_candidates(
+    project_id: str,
+    selected_candidates: list[dict[str, Any]],
+    available_fields: list[str] | tuple[str, ...] | set[str] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Persist only selected candidates, with validation-based default enablement."""
+    existing = load_kpi_definitions(project_id)
+    field_mappings = _load_validation_field_mappings(project_id)
+    existing_ids = {str(item.get("kpi_id", "")) for item in existing}
+    existing_keys = {_kpi_identity(item) for item in existing}
+    saved_items = []
+    skipped_items = []
+    failed_items = []
+
+    for candidate in selected_candidates or []:
+        if not isinstance(candidate, dict):
+            failed_items.append({"kpi_name": "", "reason": "候选数据格式无效。"})
+            continue
+        kpi_name = str(candidate.get("kpi_name", "")).strip()
+        if not kpi_name:
+            failed_items.append({"kpi_name": "", "reason": "KPI 名称不能为空。"})
+            continue
+        prepared = _prepare_saved_kpi(
+            candidate,
+            default_enabled=True,
+            available_fields=available_fields,
+            field_mappings=field_mappings,
+        )
+        identity = _kpi_identity(prepared)
+        if prepared["kpi_id"] in existing_ids or identity in existing_keys:
+            skipped_items.append(
+                {"kpi_name": prepared["kpi_name"], "reason": "指标已保存。"}
+            )
+            continue
+        saved_items.append(prepared)
+        existing_ids.add(prepared["kpi_id"])
+        existing_keys.add(identity)
+
+    all_kpis = existing
+    if saved_items:
+        all_kpis = save_kpi_definitions(
+            project_id,
+            existing + saved_items,
+            available_fields=available_fields,
+        )
+        saved_ids = {item["kpi_id"] for item in saved_items}
+        saved_items = [
+            item for item in all_kpis if item.get("kpi_id") in saved_ids
+        ]
+    return {
+        "saved": saved_items,
+        "skipped": skipped_items,
+        "failed": failed_items,
+        "all_kpis": all_kpis,
+    }
+
+
+def save_edited_kpi_definitions(
+    project_id: str,
+    kpis: list[dict[str, Any]],
+    available_fields: list[str] | tuple[str, ...] | set[str] | None = None,
+) -> dict[str, Any]:
+    """Revalidate saved KPI edits and disable definitions that are not valid."""
+    field_mappings = _load_validation_field_mappings(project_id)
+    normalized = []
+    forced_disabled = []
+    for item in kpis or []:
+        if not isinstance(item, dict) or not str(item.get("kpi_name", "")).strip():
+            continue
+        requested_enabled = bool(item.get("enabled", False))
+        prepared = _prepare_saved_kpi(
+            item,
+            default_enabled=None,
+            available_fields=available_fields,
+            field_mappings=field_mappings,
+        )
+        if requested_enabled and not prepared["enabled"]:
+            forced_disabled.append(prepared["kpi_name"])
+        normalized.append(prepared)
+    saved = save_kpi_definitions(
+        project_id,
+        normalized,
+        available_fields=available_fields,
+    )
+    return {"saved": saved, "forced_disabled": forced_disabled}
+
+
+def add_saved_kpi_definition(
+    project_id: str,
+    kpi: dict[str, Any],
+    available_fields: list[str] | tuple[str, ...] | set[str] | None = None,
+) -> dict[str, Any]:
+    """Create one formal KPI and default-enable it only when validation succeeds."""
+    field_mappings = _load_validation_field_mappings(project_id)
+    prepared = _prepare_saved_kpi(
+        {**dict(kpi), "created_by": "user"},
+        default_enabled=True,
+        available_fields=available_fields,
+        field_mappings=field_mappings,
+    )
+    existing = load_kpi_definitions(project_id)
+    if any(_kpi_identity(item) == _kpi_identity(prepared) for item in existing):
+        raise ValueError(f"指标已存在：{prepared['kpi_name']}")
+    saved = save_kpi_definitions(
+        project_id,
+        existing + [prepared],
+        available_fields=available_fields,
+    )
+    return next(item for item in saved if item["kpi_id"] == prepared["kpi_id"])
 
 
 def get_kpi_by_name(project_id: str, kpi_name: str) -> dict[str, Any] | None:
@@ -178,6 +392,39 @@ def _normalize_with_timestamp(
     )
     normalized["updated_at"] = normalized["updated_at"] or _utc_now()
     return normalized
+
+
+def _prepare_saved_kpi(
+    kpi: dict[str, Any],
+    *,
+    default_enabled: bool | None,
+    available_fields: list[str] | tuple[str, ...] | set[str] | None,
+    field_mappings: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    normalized = normalize_kpi_definition(
+        kpi,
+        lifecycle_status="saved",
+        available_fields=available_fields,
+        field_mappings=field_mappings,
+    )
+    requested_enabled = (
+        bool(kpi.get("enabled", False))
+        if default_enabled is None
+        else default_enabled
+    )
+    normalized["enabled"] = bool(
+        requested_enabled and normalized["validation_status"] == "valid"
+    )
+    return normalized
+
+
+def _kpi_identity(kpi: dict[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        str(kpi.get("kpi_name", "")).strip().casefold(),
+        str(kpi.get("aggregation", "")).strip().lower(),
+        str(kpi.get("source_field", "")).strip(),
+        str(kpi.get("category", "")).strip(),
+    )
 
 
 def _load_validation_field_mappings(

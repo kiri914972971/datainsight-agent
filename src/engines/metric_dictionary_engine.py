@@ -27,6 +27,9 @@ def generate_metric_candidates_from_kpis(
     """Generate business metric dictionary candidates from KPI definitions."""
     candidates = []
     for kpi in kpis or []:
+        lifecycle_status = str(kpi.get("lifecycle_status", "saved")).strip()
+        if lifecycle_status and lifecycle_status != "saved":
+            continue
         kpi_name = str(kpi.get("kpi_name", "")).strip()
         if not kpi_name:
             continue

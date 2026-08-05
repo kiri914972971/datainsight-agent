@@ -17,12 +17,20 @@ from src.engines.kpi_engine import (
 from src.engines.metric_dictionary_engine import generate_metric_candidates_from_kpis
 from src.services.field_mapping_service import save_field_mappings
 from src.services.kpi_service import (
+    add_saved_kpi_definition,
     add_kpi_definition,
     delete_kpi_definition,
+    filter_unsaved_kpi_candidates,
+    generate_project_kpi_candidates,
+    kpi_collection_signature,
     list_enabled_kpis,
+    list_unsaved_kpi_candidates,
     list_usable_kpis,
     load_kpi_definitions,
+    save_edited_kpi_definitions,
     save_kpi_definitions,
+    save_selected_kpi_candidates,
+    summarize_kpi_center,
     update_kpi_definition,
 )
 from src.services.metric_dictionary_service import generate_project_metric_candidates
@@ -250,6 +258,66 @@ class KpiPureStatusModelTests(unittest.TestCase):
         self.assertEqual(len(metric_candidates), 1)
         self.assertEqual(metric_candidates[0]["metric_name"], "销售额")
 
+    def test_candidate_ids_and_collection_signatures_are_stable(self):
+        first = generate_kpi_candidates(FIELD_MAPPINGS)
+        second = generate_kpi_candidates(FIELD_MAPPINGS)
+
+        self.assertEqual(
+            [item["kpi_id"] for item in first],
+            [item["kpi_id"] for item in second],
+        )
+        self.assertEqual(
+            kpi_collection_signature(first),
+            kpi_collection_signature(second),
+        )
+
+    def test_unsaved_filter_uses_saved_id_even_after_candidate_name_edit(self):
+        candidate = generate_kpi_candidates(FIELD_MAPPINGS)[0]
+        saved_edit = {
+            **candidate,
+            "kpi_name": "用户修改后的销售额",
+            "lifecycle_status": "saved",
+        }
+
+        result = filter_unsaved_kpi_candidates([saved_edit], [candidate])
+
+        self.assertEqual(result, [])
+
+    def test_center_summary_never_counts_candidates_as_enabled_or_invalid(self):
+        summary = summarize_kpi_center(
+            [
+                _kpi(kpi_id="valid", enabled=True),
+                _kpi(
+                    kpi_id="invalid",
+                    kpi_name="错误指标",
+                    aggregation="median",
+                    enabled=True,
+                    validation_status="invalid",
+                ),
+                _kpi(
+                    kpi_id="pending",
+                    kpi_name="同比",
+                    aggregation="reserved",
+                    enabled=False,
+                    validation_status="pending",
+                ),
+            ],
+            [
+                _kpi(
+                    kpi_id="candidate",
+                    lifecycle_status="candidate",
+                    enabled=True,
+                )
+            ],
+            [_kpi(kpi_id="valid")],
+        )
+
+        self.assertEqual(summary["candidate_count"], 1)
+        self.assertEqual(summary["saved_count"], 3)
+        self.assertEqual(summary["enabled_count"], 2)
+        self.assertEqual(summary["usable_count"], 1)
+        self.assertEqual(summary["invalid_count"], 1)
+
 
 class KpiPersistedStatusModelTests(unittest.TestCase):
     def setUp(self):
@@ -427,6 +495,133 @@ class KpiPersistedStatusModelTests(unittest.TestCase):
 
         self.assertEqual(load_kpi_definitions(other_project["project_id"]), [])
         self.assertEqual(len(load_kpi_definitions(self.project_id)), 1)
+
+    def test_only_selected_candidates_are_saved_and_removed_from_candidates(self):
+        candidates = generate_project_kpi_candidates(self.project_id)
+        selected = next(
+            item for item in candidates if item["kpi_name"] == "销售额"
+        )
+
+        result = save_selected_kpi_candidates(
+            self.project_id,
+            [selected],
+            available_fields=[item["column_name"] for item in FIELD_MAPPINGS],
+        )
+
+        self.assertEqual([item["kpi_name"] for item in result["saved"]], ["销售额"])
+        self.assertTrue(result["saved"][0]["enabled"])
+        self.assertEqual(result["saved"][0]["lifecycle_status"], "saved")
+        self.assertNotIn(
+            selected["kpi_id"],
+            [item["kpi_id"] for item in list_unsaved_kpi_candidates(self.project_id)],
+        )
+        self.assertGreater(len(list_unsaved_kpi_candidates(self.project_id)), 0)
+
+    def test_candidate_save_defaults_valid_on_and_invalid_or_pending_off(self):
+        candidates = generate_project_kpi_candidates(self.project_id)
+        valid = next(item for item in candidates if item["kpi_name"] == "销售额")
+        pending = next(item for item in candidates if item["aggregation"] == "reserved")
+        invalid = {
+            **next(item for item in candidates if item["kpi_name"] == "客单价"),
+            "aggregation": "median",
+        }
+
+        result = save_selected_kpi_candidates(
+            self.project_id,
+            [valid, pending, invalid],
+            available_fields=[item["column_name"] for item in FIELD_MAPPINGS],
+        )
+        by_status = {item["validation_status"]: item for item in result["saved"]}
+
+        self.assertTrue(by_status["valid"]["enabled"])
+        self.assertFalse(by_status["pending"]["enabled"])
+        self.assertFalse(by_status["invalid"]["enabled"])
+
+    def test_empty_or_duplicate_candidate_selection_does_not_duplicate_saved_kpi(self):
+        candidate = generate_project_kpi_candidates(self.project_id)[0]
+        empty_result = save_selected_kpi_candidates(self.project_id, [])
+        first = save_selected_kpi_candidates(self.project_id, [candidate])
+        second = save_selected_kpi_candidates(self.project_id, [candidate])
+
+        self.assertEqual(empty_result["saved"], [])
+        self.assertEqual(len(first["saved"]), 1)
+        self.assertEqual(second["saved"], [])
+        self.assertEqual(len(second["skipped"]), 1)
+        self.assertEqual(len(load_kpi_definitions(self.project_id)), 1)
+
+    def test_valid_candidate_is_saved_when_another_selected_row_fails(self):
+        candidate = generate_project_kpi_candidates(self.project_id)[0]
+
+        result = save_selected_kpi_candidates(
+            self.project_id,
+            [candidate, {**candidate, "kpi_id": "empty-name", "kpi_name": ""}],
+        )
+
+        self.assertEqual(len(result["saved"]), 1)
+        self.assertEqual(len(result["failed"]), 1)
+        self.assertEqual(len(load_kpi_definitions(self.project_id)), 1)
+
+    def test_saved_edits_force_invalid_and_pending_kpis_disabled(self):
+        result = save_edited_kpi_definitions(
+            self.project_id,
+            [
+                _kpi(kpi_id="valid", enabled=True),
+                _kpi(
+                    kpi_id="invalid",
+                    kpi_name="错误指标",
+                    aggregation="median",
+                    enabled=True,
+                ),
+                _kpi(
+                    kpi_id="pending",
+                    kpi_name="同比",
+                    aggregation="reserved",
+                    source_field="成交日期",
+                    field_type="date",
+                    enabled=True,
+                ),
+            ],
+            available_fields=[item["column_name"] for item in FIELD_MAPPINGS],
+        )
+        by_id = {item["kpi_id"]: item for item in result["saved"]}
+
+        self.assertTrue(by_id["valid"]["enabled"])
+        self.assertFalse(by_id["invalid"]["enabled"])
+        self.assertFalse(by_id["pending"]["enabled"])
+        self.assertCountEqual(result["forced_disabled"], ["错误指标", "同比"])
+
+    def test_new_custom_kpi_uses_validation_based_default_enablement(self):
+        valid = add_saved_kpi_definition(
+            self.project_id,
+            _kpi(kpi_id="custom-valid", kpi_name="自定义销售额"),
+            available_fields=[item["column_name"] for item in FIELD_MAPPINGS],
+        )
+        pending = add_saved_kpi_definition(
+            self.project_id,
+            _kpi(
+                kpi_id="custom-pending",
+                kpi_name="自定义同比",
+                aggregation="reserved",
+                source_field="成交日期",
+                field_type="date",
+            ),
+            available_fields=[item["column_name"] for item in FIELD_MAPPINGS],
+        )
+
+        self.assertEqual(valid["lifecycle_status"], "saved")
+        self.assertTrue(valid["enabled"])
+        self.assertFalse(pending["enabled"])
+
+    def test_deleted_saved_candidate_can_be_generated_again(self):
+        candidate = generate_project_kpi_candidates(self.project_id)[0]
+        save_selected_kpi_candidates(self.project_id, [candidate])
+
+        delete_kpi_definition(self.project_id, candidate["kpi_id"])
+
+        self.assertIn(
+            candidate["kpi_id"],
+            [item["kpi_id"] for item in list_unsaved_kpi_candidates(self.project_id)],
+        )
 
     def _config_path(self):
         return self.project_root / self.project_id / "config" / "kpi_definitions.json"

@@ -226,13 +226,15 @@ from src.services.field_mapping_service import (
     save_field_mappings,
 )
 from src.services.kpi_service import (
-    add_kpi_definition,
+    add_saved_kpi_definition,
     delete_kpi_definition,
-    generate_project_kpi_candidates,
-    list_enabled_kpis,
+    kpi_collection_signature,
     load_kpi_definitions,
-    merged_project_kpis,
-    save_kpi_definitions,
+    list_unsaved_kpi_candidates,
+    list_usable_kpis,
+    save_edited_kpi_definitions,
+    save_selected_kpi_candidates,
+    summarize_kpi_center,
 )
 from src.services.metric_dictionary_service import (
     add_metric_definition,
@@ -3658,110 +3660,298 @@ def render_kpi_center_tab(
             "target",
             "KPI Definition Engine",
             "指标计算规则",
-            "定义项目中的核心业务指标计算方式，并保存为后续探索分析、业务分析、报告和问答的统一指标口径。",
+            "管理自动推荐候选与当前项目已保存的正式指标计算规则。",
         )
         st.info(
-            "指标计算规则用于定义项目中的核心业务指标怎么算。后续探索分析、业务分析、周报、月报、Dashboard、AI问答都会优先使用这里定义的规则。"
+            "指标中心用于管理项目中的业务指标定义。后续需要正式指标的功能，应使用已保存、已启用且校验通过的指标。"
         )
 
     try:
-        existing_kpis = load_kpi_definitions(project_id)
-        candidate_kpis = generate_project_kpi_candidates(project_id)
-        current_kpis = merged_project_kpis(project_id)
+        saved_kpis = load_kpi_definitions(project_id)
+        candidate_kpis = list_unsaved_kpi_candidates(project_id)
+        usable_kpis = list_usable_kpis(
+            project_id,
+            available_fields=[str(column) for column in dataframe.columns],
+        )
     except ValueError as exc:
         st.error(str(exc))
-        existing_kpis = []
+        saved_kpis = []
         candidate_kpis = []
-        current_kpis = []
+        usable_kpis = []
 
-    summary_columns = st.columns(4)
-    summary_columns[0].metric("计算规则", len(current_kpis))
-    summary_columns[1].metric("已启用", len([item for item in current_kpis if item.get("enabled")]))
-    summary_columns[2].metric("自动候选", len(candidate_kpis))
-    summary_columns[3].metric("已保存", len(existing_kpis))
+    summary = summarize_kpi_center(saved_kpis, candidate_kpis, usable_kpis)
+    summary_columns = st.columns(5)
+    summary_columns[0].metric("自动推荐", summary["candidate_count"])
+    summary_columns[1].metric("已保存", summary["saved_count"])
+    summary_columns[2].metric("已启用", summary["enabled_count"])
+    summary_columns[3].metric("可供下游使用", summary["usable_count"])
+    summary_columns[4].metric("校验异常", summary["invalid_count"])
 
-    if not candidate_kpis and not current_kpis:
-        st.warning("当前项目还没有可生成指标计算规则的字段映射。请先在“字段映射”中确认金额、ID、日期、区域、产品或人员字段。")
+    legacy_message = st.session_state.pop("kpi_center_message", None)
+    if legacy_message:
+        st.success(legacy_message)
+    notice_key = f"kpi_center_notices_{project_id}"
+    for notice in st.session_state.pop(notice_key, []):
+        getattr(st, notice.get("level", "info"))(notice.get("message", ""))
 
-    st.subheader("指标计算规则")
-    st.caption("这里管理指标“怎么算”：聚合方式、来源字段、字段类型、启用状态和创建方式。")
+    st.subheader("自动推荐候选")
+    st.caption(
+        "系统根据字段映射推荐可能的指标。候选指标尚未保存，也不会进入业务分析或报告。请确认计算规则后选择保存。"
+    )
     source_field_options = ["项目级预留"] + [str(column) for column in dataframe.columns]
-    kpi_rows = pd.DataFrame(
-        [
-            {
-                "_kpi_id": item["kpi_id"],
-                "_description": item["description"],
-                "启用状态": bool(item["enabled"]),
-                "指标名称": item["kpi_name"],
-                "分类": item["category"],
-                "聚合方式": item["aggregation"],
-                "来源字段": item["source_field"] or "项目级预留",
-                "字段类型": item["field_type"],
-                "创建方式": "自动候选" if item.get("created_by") == "auto" else "用户定义",
-            }
-            for item in current_kpis
-        ],
-        columns=[
-            "_kpi_id",
-            "_description",
-            "启用状态",
-            "指标名称",
-            "分类",
-            "聚合方式",
-            "来源字段",
-            "字段类型",
-            "创建方式",
-        ],
-    )
-    edited_rows = st.data_editor(
-        kpi_rows,
-        use_container_width=True,
-        hide_index=True,
-        column_order=["指标名称", "分类", "聚合方式", "来源字段", "字段类型", "启用状态", "创建方式"],
-        disabled=["创建方式"],
-        column_config={
-            "启用状态": st.column_config.CheckboxColumn("启用状态"),
-            "分类": st.column_config.SelectboxColumn("分类", options=list(KPI_CATEGORIES)),
-            "聚合方式": st.column_config.SelectboxColumn(
-                "聚合方式",
-                options=list(SUPPORTED_AGGREGATIONS) + [RESERVED_AGGREGATION],
-            ),
-            "来源字段": st.column_config.SelectboxColumn(
-                "来源字段",
-                options=source_field_options,
-            ),
-            "字段类型": st.column_config.SelectboxColumn(
-                "字段类型",
-                options=["amount", "id", "date", "region", "product", "person", "custom"],
-            ),
-        },
-        key=f"kpi_definition_editor_{project_id}",
-    )
-
-    if st.button("保存指标计算规则", type="primary", key=f"save_kpis_{project_id}"):
-        definitions = []
-        for index, row in enumerate(edited_rows.to_dict("records")):
-            original_item = current_kpis[index] if index < len(current_kpis) else {}
-            definitions.append(
+    candidate_signature = kpi_collection_signature(candidate_kpis)
+    candidate_by_id = {
+        str(item.get("kpi_id", "")): item for item in candidate_kpis
+    }
+    if candidate_kpis:
+        candidate_rows = pd.DataFrame(
+            [
                 {
-                    "kpi_id": row.get("_kpi_id") or original_item.get("kpi_id"),
-                    "kpi_name": row["指标名称"],
-                    "category": row["分类"],
-                    "aggregation": row["聚合方式"],
-                    "source_field": "" if row["来源字段"] == "项目级预留" else row["来源字段"],
-                    "field_type": row["字段类型"],
-                    "description": row.get("_description", original_item.get("description", "")),
-                    "enabled": row["启用状态"],
-                    "created_by": "auto" if row["创建方式"] == "自动候选" else "user",
+                    "_kpi_id": item["kpi_id"],
+                    "选择": False,
+                    "指标名称": item["kpi_name"],
+                    "分类": item["category"],
+                    "聚合方式": item["aggregation"],
+                    "来源字段": item["source_field"] or "项目级预留",
+                    "字段类型": item["field_type"],
+                    "推荐说明": item["description"],
+                    "当前状态": "待确认",
                 }
-            )
-        save_kpi_definitions(project_id, definitions)
-        st.session_state.kpi_center_message = "指标计算规则已保存到当前项目。"
-        st.rerun()
+                for item in candidate_kpis
+            ]
+        )
+        edited_candidates = st.data_editor(
+            candidate_rows,
+            use_container_width=True,
+            hide_index=True,
+            height=calculate_dataframe_height(len(candidate_rows)),
+            column_order=[
+                "选择",
+                "指标名称",
+                "分类",
+                "聚合方式",
+                "来源字段",
+                "字段类型",
+                "推荐说明",
+                "当前状态",
+            ],
+            disabled=["当前状态"],
+            column_config={
+                "选择": st.column_config.CheckboxColumn("选择", default=False),
+                "分类": st.column_config.SelectboxColumn(
+                    "分类", options=list(KPI_CATEGORIES)
+                ),
+                "聚合方式": st.column_config.SelectboxColumn(
+                    "聚合方式",
+                    options=list(SUPPORTED_AGGREGATIONS)
+                    + [RESERVED_AGGREGATION],
+                ),
+                "来源字段": st.column_config.SelectboxColumn(
+                    "来源字段", options=source_field_options
+                ),
+                "字段类型": st.column_config.SelectboxColumn(
+                    "字段类型",
+                    options=[
+                        "amount",
+                        "numeric",
+                        "id",
+                        "date",
+                        "region",
+                        "product",
+                        "person",
+                        "custom",
+                    ],
+                ),
+            },
+            key=f"kpi_candidate_editor_{project_id}_{candidate_signature}",
+        )
+        if st.button(
+            "保存选中指标",
+            type="primary",
+            key=f"save_selected_kpis_{project_id}_{candidate_signature}",
+        ):
+            selected_candidates = []
+            for row in edited_candidates.to_dict("records"):
+                if not row.get("选择"):
+                    continue
+                original_item = candidate_by_id.get(str(row.get("_kpi_id", "")), {})
+                selected_candidates.append(
+                    {
+                        **original_item,
+                        "kpi_id": row.get("_kpi_id") or original_item.get("kpi_id"),
+                        "kpi_name": row.get("指标名称", ""),
+                        "category": row.get("分类", "核心指标"),
+                        "aggregation": row.get("聚合方式", ""),
+                        "source_field": (
+                            ""
+                            if row.get("来源字段") == "项目级预留"
+                            else row.get("来源字段", "")
+                        ),
+                        "field_type": row.get("字段类型", "custom"),
+                        "description": row.get("推荐说明", ""),
+                        "created_by": "auto",
+                        "lifecycle_status": "candidate",
+                    }
+                )
+            if not selected_candidates:
+                st.warning("请至少选择一个候选指标。")
+            else:
+                result = save_selected_kpi_candidates(
+                    project_id,
+                    selected_candidates,
+                    available_fields=[str(column) for column in dataframe.columns],
+                )
+                notices = []
+                if result["saved"]:
+                    notices.append(
+                        {
+                            "level": "success",
+                            "message": f"已保存 {len(result['saved'])} 个指标。",
+                        }
+                    )
+                issues = result["failed"] + result["skipped"]
+                if issues:
+                    details = "；".join(
+                        f"{item.get('kpi_name') or '未命名指标'}：{item.get('reason')}"
+                        for item in issues
+                    )
+                    notices.append(
+                        {"level": "warning", "message": f"部分指标未保存：{details}"}
+                    )
+                if result["saved"]:
+                    st.session_state[notice_key] = notices
+                    st.rerun()
+                for notice in notices:
+                    getattr(st, notice["level"])(notice["message"])
+    else:
+        st.info("当前字段映射没有生成新的指标候选，或所有候选均已保存。")
 
-    message = st.session_state.pop("kpi_center_message", None)
-    if message:
-        st.success(message)
+    st.subheader("已保存指标")
+    st.caption(
+        "已保存指标属于当前项目记忆。只有已启用且校验通过的指标，才可供后续业务分析和报告使用。"
+    )
+    saved_signature = kpi_collection_signature(saved_kpis)
+    saved_by_id = {str(item.get("kpi_id", "")): item for item in saved_kpis}
+    validation_labels = {
+        "valid": "校验通过",
+        "invalid": "校验异常",
+        "pending": "待完善",
+    }
+    if saved_kpis:
+        saved_rows = pd.DataFrame(
+            [
+                {
+                    "_kpi_id": item["kpi_id"],
+                    "指标名称": item["kpi_name"],
+                    "分类": item["category"],
+                    "聚合方式": item["aggregation"],
+                    "来源字段": item["source_field"] or "项目级预留",
+                    "字段类型": item["field_type"],
+                    "描述": item["description"],
+                    "启用状态": bool(item["enabled"]),
+                    "校验状态": validation_labels.get(
+                        item.get("validation_status"), "待完善"
+                    ),
+                    "校验说明": "；".join(item.get("validation_messages", [])) or "—",
+                    "创建方式": (
+                        "自动推荐后保存"
+                        if item.get("created_by") == "auto"
+                        else "用户定义"
+                    ),
+                }
+                for item in saved_kpis
+            ]
+        )
+        edited_saved = st.data_editor(
+            saved_rows,
+            use_container_width=True,
+            hide_index=True,
+            height=calculate_dataframe_height(len(saved_rows)),
+            column_order=[
+                "指标名称",
+                "分类",
+                "聚合方式",
+                "来源字段",
+                "字段类型",
+                "描述",
+                "启用状态",
+                "校验状态",
+                "校验说明",
+                "创建方式",
+            ],
+            disabled=["校验状态", "校验说明", "创建方式"],
+            column_config={
+                "启用状态": st.column_config.CheckboxColumn("启用状态"),
+                "分类": st.column_config.SelectboxColumn(
+                    "分类", options=list(KPI_CATEGORIES)
+                ),
+                "聚合方式": st.column_config.SelectboxColumn(
+                    "聚合方式",
+                    options=list(SUPPORTED_AGGREGATIONS)
+                    + [RESERVED_AGGREGATION],
+                ),
+                "来源字段": st.column_config.SelectboxColumn(
+                    "来源字段", options=source_field_options
+                ),
+                "字段类型": st.column_config.SelectboxColumn(
+                    "字段类型",
+                    options=[
+                        "amount",
+                        "numeric",
+                        "id",
+                        "date",
+                        "region",
+                        "product",
+                        "person",
+                        "custom",
+                    ],
+                ),
+            },
+            key=f"kpi_saved_editor_{project_id}_{saved_signature}",
+        )
+        if st.button(
+            "保存指标修改",
+            type="primary",
+            key=f"save_saved_kpis_{project_id}_{saved_signature}",
+        ):
+            definitions = []
+            for row in edited_saved.to_dict("records"):
+                original_item = saved_by_id.get(str(row.get("_kpi_id", "")), {})
+                definitions.append(
+                    {
+                        **original_item,
+                        "kpi_id": row.get("_kpi_id") or original_item.get("kpi_id"),
+                        "kpi_name": row.get("指标名称", ""),
+                        "category": row.get("分类", "核心指标"),
+                        "aggregation": row.get("聚合方式", ""),
+                        "source_field": (
+                            ""
+                            if row.get("来源字段") == "项目级预留"
+                            else row.get("来源字段", "")
+                        ),
+                        "field_type": row.get("字段类型", "custom"),
+                        "description": row.get("描述", ""),
+                        "enabled": bool(row.get("启用状态", False)),
+                        "lifecycle_status": "saved",
+                    }
+                )
+            result = save_edited_kpi_definitions(
+                project_id,
+                definitions,
+                available_fields=[str(column) for column in dataframe.columns],
+            )
+            notices = [{"level": "success", "message": "指标修改已保存。"}]
+            if result["forced_disabled"]:
+                notices.append(
+                    {
+                        "level": "warning",
+                        "message": "部分指标因校验未通过或仍为待完善状态，无法启用。",
+                    }
+                )
+            st.session_state[notice_key] = notices
+            st.rerun()
+    else:
+        st.info("当前尚未保存正式指标。请从自动推荐候选中选择保存，或新增自定义指标。")
 
     st.subheader("新增指标计算规则")
     st.caption("V1 支持 SUM、COUNT、AVG、MAX、MIN。客单价等复杂公式会在后续公式引擎中支持。")
@@ -3773,7 +3963,7 @@ def render_kpi_center_tab(
         new_source_field = add_columns[3].selectbox("来源字段", [str(column) for column in dataframe.columns])
         new_field_type = add_columns[4].selectbox(
             "字段类型",
-            ["amount", "id", "date", "region", "product", "person", "custom"],
+            ["amount", "numeric", "id", "date", "region", "product", "person", "custom"],
         )
         new_description = st.text_input("描述", placeholder="说明这个 KPI 的业务含义")
         submitted = st.form_submit_button("新增指标计算规则", type="primary")
@@ -3781,42 +3971,63 @@ def render_kpi_center_tab(
             if not new_name.strip():
                 st.error("指标名称不能为空。")
             else:
-                add_kpi_definition(
-                    project_id,
-                    {
-                        "kpi_name": new_name,
-                        "category": new_category,
-                        "aggregation": new_aggregation,
-                        "source_field": new_source_field,
-                        "field_type": new_field_type,
-                        "description": new_description,
-                        "enabled": True,
-                        "created_by": "user",
-                    },
-                )
-                st.session_state.kpi_center_message = "新指标计算规则已添加。"
-                st.rerun()
+                try:
+                    added = add_saved_kpi_definition(
+                        project_id,
+                        {
+                            "kpi_name": new_name,
+                            "category": new_category,
+                            "aggregation": new_aggregation,
+                            "source_field": new_source_field,
+                            "field_type": new_field_type,
+                            "description": new_description,
+                            "created_by": "user",
+                        },
+                        available_fields=[str(column) for column in dataframe.columns],
+                    )
+                except ValueError as exc:
+                    st.error(str(exc))
+                else:
+                    status_note = (
+                        "并已默认启用"
+                        if added["enabled"]
+                        else "，因校验未通过或仍待完善而保持禁用"
+                    )
+                    st.session_state[notice_key] = [
+                        {
+                            "level": "success",
+                            "message": f"新指标计算规则已添加{status_note}。",
+                        }
+                    ]
+                    st.rerun()
 
     st.subheader("删除指标计算规则")
-    saved_kpis = load_kpi_definitions(project_id)
     if saved_kpis:
         delete_options = {item["kpi_id"]: f"{item['kpi_name']} · {item['source_field'] or '项目级预留'}" for item in saved_kpis}
         delete_kpi_id = st.selectbox(
             "选择要删除的指标计算规则",
             list(delete_options),
             format_func=lambda value: delete_options[value],
-            key=f"delete_kpi_select_{project_id}",
+            key=f"delete_kpi_select_{project_id}_{saved_signature}",
         )
-        if st.button("删除所选指标计算规则", key=f"delete_kpi_{project_id}"):
+        if st.button(
+            "删除所选指标计算规则",
+            key=f"delete_kpi_{project_id}_{saved_signature}",
+        ):
             delete_kpi_definition(project_id, delete_kpi_id)
-            st.session_state.kpi_center_message = "指标计算规则已删除。"
+            st.session_state[notice_key] = [
+                {"level": "success", "message": "指标计算规则已删除。"},
+                {
+                    "level": "info",
+                    "message": "该指标可能存在关联的指标语义定义，请前往【指标语义字典】检查。",
+                },
+            ]
             st.rerun()
     else:
         st.info("当前还没有已保存的指标计算规则。保存候选或新增规则后，可在这里删除。")
 
-    enabled_kpis = list_enabled_kpis(project_id)
     st.caption(
-        f"指标计算规则保存在 config/kpi_definitions.json，并同步写入 project.json。当前启用 {len(enabled_kpis)} 条规则。"
+        "指标计算规则保存在 config/kpi_definitions.json，并同步写入 project.json。"
     )
 
 
@@ -3829,14 +4040,14 @@ def render_metric_dictionary_tab(project_id: str, show_intro: bool = True) -> No
             "把不同企业、不同表里的字段叫法统一成项目级业务指标，并关联到 KPI 定义。",
         )
         st.info(
-            "指标语义字典用于管理业务指标名称、业务定义、常见别名和关联计算规则。后续探索分析、业务分析、Dashboard、AI问答会优先读取这里的统一口径。"
+            "指标语义字典用于维护已保存指标的业务定义和别名。指标是否可供下游使用，仍由其保存、启用和校验状态共同决定。"
         )
 
     try:
         existing_metrics = load_metric_dictionary(project_id)
         candidate_metrics = generate_project_metric_candidates(project_id)
         current_metrics = merged_project_metrics(project_id)
-        project_kpis = merged_project_kpis(project_id)
+        project_kpis = load_kpi_definitions(project_id)
     except ValueError as exc:
         st.error(str(exc))
         existing_metrics = []
@@ -3845,14 +4056,33 @@ def render_metric_dictionary_tab(project_id: str, show_intro: bool = True) -> No
         project_kpis = []
 
     no_linked_rule_label = "不关联指标计算规则"
-    kpi_options = [no_linked_rule_label] + _unique_values(
+    saved_kpi_options = [no_linked_rule_label] + _unique_values(
         [str(item.get("kpi_name", "")) for item in project_kpis if item.get("kpi_name")]
     )
+    historical_linked_kpis = _unique_values(
+        [
+            str(item.get("linked_kpi_name", ""))
+            for item in existing_metrics
+            if item.get("linked_kpi_name")
+        ]
+    )
+    kpi_options = saved_kpi_options + [
+        name for name in historical_linked_kpis if name not in saved_kpi_options
+    ]
     kpi_id_by_name = {
         str(item.get("kpi_name", "")): str(item.get("kpi_id", ""))
         for item in project_kpis
         if item.get("kpi_name")
     }
+    kpi_id_by_name.update(
+        {
+            str(item.get("linked_kpi_name", "")): str(
+                item.get("linked_kpi_id", "")
+            )
+            for item in existing_metrics
+            if item.get("linked_kpi_name")
+        }
+    )
 
     summary_columns = st.columns(4)
     summary_columns[0].metric("指标定义", len(current_metrics))
@@ -3860,8 +4090,12 @@ def render_metric_dictionary_tab(project_id: str, show_intro: bool = True) -> No
     summary_columns[2].metric("自动候选", len(candidate_metrics))
     summary_columns[3].metric("别名数量", sum(len(item.get("aliases", [])) for item in current_metrics))
 
-    if not candidate_metrics and not current_metrics:
-        st.warning("当前项目还没有可生成指标语义字典的计算规则。请先在“指标中心”的“指标计算规则”中保存或新增规则。")
+    if not project_kpis:
+        st.info(
+            "当前尚未保存指标计算规则。请先在【指标计算规则】中确认并保存指标，再维护指标业务定义和别名。"
+        )
+        if existing_metrics:
+            st.caption("已有指标语义定义会继续保留，但其关联 KPI 可能已不存在，请逐项检查。")
 
     st.subheader("指标语义字典")
     st.caption("这里管理指标“叫什么”：业务定义、别名、指标类型，以及关联哪条指标计算规则。")
@@ -3939,7 +4173,9 @@ def render_metric_dictionary_tab(project_id: str, show_intro: bool = True) -> No
         add_columns = st.columns(4)
         new_metric_name = add_columns[0].text_input("指标名称", placeholder="例如：销售额")
         new_metric_type = add_columns[1].selectbox("指标类型", list(METRIC_CATEGORIES))
-        new_linked_kpi = add_columns[2].selectbox("关联指标计算规则", kpi_options)
+        new_linked_kpi = add_columns[2].selectbox(
+            "关联指标计算规则", saved_kpi_options
+        )
         new_enabled = add_columns[3].checkbox("启用", value=True)
         new_definition = st.text_input("业务定义", placeholder="说明这个指标的统一业务含义")
         new_aliases = st.text_area(
@@ -4000,10 +4236,10 @@ def render_metric_center_tab(project_id: str, dataframe: pd.DataFrame) -> None:
         "target",
         "Metric Center",
         "指标中心",
-        "指标中心用于管理项目中的业务指标，包括“怎么算”和“叫什么”。后续探索分析、业务分析、Dashboard和报告都会优先使用这里的指标定义。",
+        "指标中心用于管理项目中的业务指标定义，并区分自动推荐、正式保存、启用和校验状态。",
     )
     st.info(
-        "指标中心用于管理项目中的业务指标，包括“怎么算”和“叫什么”。后续探索分析、业务分析、Dashboard和报告都会优先使用这里的指标定义。"
+        "指标中心用于管理项目中的业务指标定义。后续需要正式指标的功能，应使用已保存、已启用且校验通过的指标。后续业务分析与报告功能将逐步接入可供下游使用的正式指标。"
     )
 
     metric_tabs = st.tabs(["指标计算规则", "指标语义字典"])

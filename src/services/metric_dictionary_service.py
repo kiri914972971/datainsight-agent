@@ -12,14 +12,19 @@ from src.engines.metric_dictionary_engine import (
     merge_metric_candidates,
     normalize_metric_definition,
 )
-from src.services.kpi_service import merged_project_kpis
+from src.services.kpi_service import load_kpi_definitions
 
 
 METRIC_DICTIONARY_FILE = "metric_dictionary.json"
 
 
 def generate_project_metric_candidates(project_id: str) -> list[dict[str, Any]]:
-    return generate_metric_candidates_from_kpis(merged_project_kpis(project_id))
+    saved_kpis = [
+        item
+        for item in load_kpi_definitions(project_id)
+        if item.get("lifecycle_status") == "saved"
+    ]
+    return generate_metric_candidates_from_kpis(saved_kpis)
 
 
 def load_metric_dictionary(project_id: str) -> list[dict[str, Any]]:

@@ -303,6 +303,12 @@ def _kpi(
 ) -> dict[str, Any]:
     return normalize_kpi_definition(
         {
+            "kpi_id": _candidate_kpi_id(
+                kpi_name,
+                aggregation,
+                source_field,
+                category,
+            ),
             "kpi_name": kpi_name,
             "aggregation": aggregation,
             "source_field": source_field,
@@ -314,6 +320,21 @@ def _kpi(
             "lifecycle_status": "candidate",
         }
     )
+
+
+def _candidate_kpi_id(
+    kpi_name: str,
+    aggregation: str,
+    source_field: str,
+    category: str,
+) -> str:
+    identity = "|".join(
+        (kpi_name, aggregation, source_field, category)
+    )
+    return uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"data-insight-agent:kpi-candidate:{identity}",
+    ).hex
 
 
 def _count_kpi_name(field: str) -> str:
