@@ -116,6 +116,45 @@ def test_automatic_datetime_candidates_use_final_derived_time_roles():
     }
 
 
+def test_invalid_persisted_datetime_mappings_are_normalized_for_overview():
+    df = pd.DataFrame(
+        {
+            "成交日期": ["2020-04-01 00:00:00", "2020-06-30"],
+            "成交年份": [2020, 2020],
+            "成交月份": [4, 6],
+        }
+    )
+    field_roles = build_exploration_field_roles(
+        df,
+        datetime_columns=list(df.columns),
+        confirmed_type_by_column={
+            "成交日期": "日期字段",
+            "成交年份": "日期字段",
+            "成交月份": "日期字段",
+        },
+    )
+
+    overview = build_exploration_overview(df, field_roles, "sales.csv")
+    excluded_by_column = {
+        item["column"]: item
+        for item in overview["excluded_fields"]
+    }
+
+    assert field_roles["role_by_column"] == {
+        "成交日期": "datetime",
+        "成交年份": "derived_time",
+        "成交月份": "derived_time",
+    }
+    assert field_roles["columns_by_role"]["datetime"] == ["成交日期"]
+    assert overview["datetime_count"] == 1
+    assert overview["datetime_summary"]["column"] == "成交日期"
+    assert get_time_distribution_datetime_columns(df, field_roles) == [
+        "成交日期"
+    ]
+    assert excluded_by_column["成交年份"]["reason"] == "时间派生字段"
+    assert excluded_by_column["成交月份"]["reason"] == "时间派生字段"
+
+
 def test_identifier_is_not_counted_as_numeric():
     df = pd.DataFrame({"销售工号": [10001, 10002]})
 

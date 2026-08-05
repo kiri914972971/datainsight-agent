@@ -133,6 +133,22 @@ def test_no_dataset_main_analysis_navigation_is_unchanged():
     assert SETUP_NAVIGATION_SOURCE.count("with analysis_tabs[") == 3
 
 
+def test_no_dataset_exploration_placeholder_tabs_match_final_structure():
+    assert (
+        '["数值分布", "类别构成", "时间分布", "相关关系"]'
+        in " ".join(SETUP_NAVIGATION_SOURCE.split())
+    )
+    assert SETUP_NAVIGATION_SOURCE.count(
+        "with exploration_placeholder_tabs["
+    ) == 4
+    for index in range(4):
+        assert (
+            f"with exploration_placeholder_tabs[{index}]:"
+            in SETUP_NAVIGATION_SOURCE
+        )
+    assert "with exploration_placeholder_tabs[4]:" not in SETUP_NAVIGATION_SOURCE
+
+
 def test_main_workbench_navigation_is_unchanged():
     assert (
         'workbench_tabs = st.tabs(["探索性分析", "Dashboard", "业务分析"])'
@@ -177,3 +193,23 @@ def test_other_exploration_control_state_keys_remain():
         "correlation_relationship_fields_",
     ):
         assert prefix in EXPLORATION_SOURCE
+
+
+def test_field_mapping_save_rejects_derived_time_as_complete_datetime():
+    field_mapping_source = APP_SOURCE.split(
+        "def render_field_mapping_tab(",
+        maxsplit=1,
+    )[1].split(
+        "@st.cache_data",
+        maxsplit=1,
+    )[0]
+    validation_position = field_mapping_source.index(
+        "get_invalid_exploration_datetime_confirmations("
+    )
+    save_position = field_mapping_source.index(
+        "save_field_mappings(project_id, confirmed_mappings)"
+    )
+
+    assert validation_position < save_position
+    assert "属于时间派生字段" in field_mapping_source
+    assert "不能保存为完整日期字段" in field_mapping_source

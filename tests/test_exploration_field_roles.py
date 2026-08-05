@@ -3,6 +3,7 @@ import pandas as pd
 from src.exploration import (
     EXPLORATION_FIELD_ROLES,
     build_exploration_field_roles,
+    get_invalid_exploration_datetime_confirmations,
     is_derived_time_column,
 )
 
@@ -120,7 +121,7 @@ def test_derived_time_overrides_automatic_datetime_detection():
         assert result["role_by_column"][column] == "derived_time"
 
 
-def test_confirmed_datetime_role_overrides_derived_time_name():
+def test_derived_time_semantics_override_invalid_confirmed_datetime_role():
     df = pd.DataFrame({"成交年份": [2020, 2021]})
 
     role = _role_for(
@@ -130,16 +131,58 @@ def test_confirmed_datetime_role_overrides_derived_time_name():
         confirmed_type_by_column={"成交年份": "日期字段"},
     )
 
+    assert role == "derived_time"
+
+
+def test_month_semantics_override_invalid_confirmed_datetime_role():
+    df = pd.DataFrame({"成交月份": [1, 6, 12]})
+
+    role = _role_for(
+        df,
+        "成交月份",
+        datetime_columns=["成交月份"],
+        confirmed_type_by_column={"成交月份": "日期字段"},
+    )
+
+    assert role == "derived_time"
+
+
+def test_confirmed_complete_date_remains_datetime():
+    df = pd.DataFrame({"成交日期": ["2020-04-01", "2020-06-30"]})
+
+    role = _role_for(
+        df,
+        "成交日期",
+        confirmed_type_by_column={"成交日期": "日期字段"},
+    )
+
     assert role == "datetime"
 
 
-def test_derived_time_helper_supports_common_english_names():
-    series = pd.Series([1, 2])
+def test_invalid_datetime_confirmation_helper_only_returns_time_components():
+    df = pd.DataFrame(
+        {
+            "成交日期": ["2020-04-01", "2020-06-30"],
+            "成交年份": [2020, 2021],
+            "成交月份": [4, 6],
+            "年销售额": [100.0, 200.0],
+            "year_revenue": [300.0, 400.0],
+        }
+    )
 
-    assert is_derived_time_column("year", series)
-    assert is_derived_time_column("created_year", series)
-    assert is_derived_time_column("order_month", series)
-    assert is_derived_time_column("created_week_day", series)
+    invalid_columns = get_invalid_exploration_datetime_confirmations(
+        df,
+        {column: "日期字段" for column in df.columns},
+    )
+
+    assert invalid_columns == ["成交年份", "成交月份"]
+
+
+def test_derived_time_helper_supports_common_english_names():
+    assert is_derived_time_column("year", pd.Series([2020, 2021]))
+    assert is_derived_time_column("created_year", pd.Series([2020, 2021]))
+    assert is_derived_time_column("order_month", pd.Series([1, 12]))
+    assert is_derived_time_column("created_week_day", pd.Series([1, 7]))
 
 
 def test_measure_names_are_not_misclassified_as_derived_time():
@@ -149,6 +192,8 @@ def test_measure_names_are_not_misclassified_as_derived_time():
             "月收入": [10, 20],
             "季度目标": [30, 40],
             "month_revenue": [50, 60],
+            "year_revenue": [2020.5, 2021.5],
+            "monthly_sales": [70, 80],
         }
     )
 

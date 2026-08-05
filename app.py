@@ -101,6 +101,7 @@ from src.exploration import (
     generate_categorical_composition_interpretation,
     get_analysis_categorical_columns,
     get_analysis_numeric_columns,
+    get_invalid_exploration_datetime_confirmations,
     get_time_distribution_datetime_columns,
     resolve_time_distribution_datetime_selection,
     summarize_categorical_columns,
@@ -2953,6 +2954,24 @@ def render_field_mapping_tab(project_id: str, dataframe: pd.DataFrame | None = N
                 }
             )
         current_columns = set(dataframe.columns)
+        invalid_datetime_confirmations = (
+            get_invalid_exploration_datetime_confirmations(
+                dataframe,
+                {
+                    item["column_name"]: item.get("confirmed_type")
+                    for item in confirmed_mappings
+                    if item.get("column_name") in current_columns
+                },
+            )
+        )
+        if invalid_datetime_confirmations:
+            st.error(
+                "以下字段仅表示年份、月份、季度或星期，属于时间派生字段，"
+                "不能保存为完整日期字段："
+                f"{', '.join(invalid_datetime_confirmations)}。"
+                "请调整用户确认类型后再保存。"
+            )
+            return
         confirmed_mappings.extend(
             item
             for item in existing_mappings
@@ -4719,7 +4738,17 @@ def render_project_setup_navigation(project_id: str) -> None:
     with setup_groups[3]:
         analysis_tabs = st.tabs(["探索性分析", "Dashboard", "业务分析"])
         with analysis_tabs[0]:
-            render_requires_dataset_notice()
+            exploration_placeholder_tabs = st.tabs(
+                ["数值分布", "类别构成", "时间分布", "相关关系"]
+            )
+            with exploration_placeholder_tabs[0]:
+                render_requires_dataset_notice()
+            with exploration_placeholder_tabs[1]:
+                render_requires_dataset_notice()
+            with exploration_placeholder_tabs[2]:
+                render_requires_dataset_notice()
+            with exploration_placeholder_tabs[3]:
+                render_requires_dataset_notice()
         with analysis_tabs[1]:
             render_requires_dataset_notice()
         with analysis_tabs[2]:

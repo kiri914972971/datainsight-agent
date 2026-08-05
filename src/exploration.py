@@ -40,63 +40,123 @@ _CONFIRMED_TYPE_TO_ROLE = {
     "其他字段": "unsupported",
 }
 
-_DERIVED_TIME_EXACT_NAMES = {
-    "年",
-    "年份",
-    "year",
-    "月",
-    "月份",
-    "month",
-    "季度",
-    "quarter",
-    "星期",
-    "周几",
-    "weekday",
-    "week_day",
-}
-
-_DERIVED_TIME_CHINESE_SUFFIXES = (
-    "年份",
-    "月份",
-    "季度",
-    "星期",
-    "周几",
-    "年",
-    "月",
-)
-
-_DERIVED_TIME_ENGLISH_SUFFIXES = (
-    "year",
-    "month",
-    "quarter",
-    "weekday",
-    "week_day",
-)
-
-
-def is_derived_time_column(column_name, series):
-    """Return whether a column name conservatively describes a derived time field."""
-    del series
-
+def _derived_time_component_kind(column_name):
     normalized_name = str(column_name).strip().lower()
-    if normalized_name in _DERIVED_TIME_EXACT_NAMES:
-        return True
+    exact_kinds = {
+        "年": "year",
+        "年份": "year",
+        "year": "year",
+        "月": "month",
+        "月份": "month",
+        "month": "month",
+        "季度": "quarter",
+        "quarter": "quarter",
+        "星期": "weekday",
+        "周几": "weekday",
+        "weekday": "weekday",
+        "week_day": "weekday",
+    }
+    if normalized_name in exact_kinds:
+        return exact_kinds[normalized_name]
 
-    if any(
-        normalized_name.endswith(suffix)
-        and len(normalized_name) > len(suffix)
-        for suffix in _DERIVED_TIME_CHINESE_SUFFIXES
-    ):
-        return True
+    chinese_suffix_kinds = (
+        ("年份", "year"),
+        ("月份", "month"),
+        ("季度", "quarter"),
+        ("星期", "weekday"),
+        ("周几", "weekday"),
+        ("年", "year"),
+        ("月", "month"),
+    )
+    for suffix, kind in chinese_suffix_kinds:
+        if normalized_name.endswith(suffix) and len(normalized_name) > len(suffix):
+            return kind
 
     tokenized_name = normalized_name.replace("-", "_").replace(" ", "_")
     while "__" in tokenized_name:
         tokenized_name = tokenized_name.replace("__", "_")
-
-    return any(
-        tokenized_name.endswith(f"_{suffix}")
-        for suffix in _DERIVED_TIME_ENGLISH_SUFFIXES
+    english_suffix_kinds = (
+        ("week_day", "weekday"),
+        ("weekday", "weekday"),
+        ("quarter", "quarter"),
+        ("month", "month"),
+        ("year", "year"),
     )
+    for suffix, kind in english_suffix_kinds:
+        if tokenized_name.endswith(f"_{suffix}"):
+            return kind
+    return None
+
+
+def _matches_derived_time_values(series, component_kind):
+    values = series.dropna()
+    if values.empty or pd.api.types.is_datetime64_any_dtype(series.dtype):
+        return False
+
+    text_values = values.astype(str).str.strip()
+    numeric_values = pd.to_numeric(text_values, errors="coerce")
+    integer_like = numeric_values.notna() & np.isclose(
+        numeric_values.fillna(0).to_numpy(dtype=float),
+        np.rint(numeric_values.fillna(0).to_numpy(dtype=float)),
+        rtol=0,
+        atol=1e-9,
+    )
+
+    if component_kind == "year":
+        matches = integer_like & numeric_values.between(1000, 9999)
+    elif component_kind == "month":
+        numeric_matches = integer_like & numeric_values.between(1, 12)
+        text_matches = text_values.str.fullmatch(
+            r"(?:0?[1-9]|1[0-2])月",
+            case=False,
+            na=False,
+        )
+        matches = numeric_matches | text_matches
+    elif component_kind == "quarter":
+        numeric_matches = integer_like & numeric_values.between(1, 4)
+        text_matches = text_values.str.fullmatch(
+            r"(?:(?:\d{4})\s*[-/]?\s*)?(?:Q[1-4]|第?[1-4]季度)",
+            case=False,
+            na=False,
+        )
+        matches = numeric_matches | text_matches
+    elif component_kind == "weekday":
+        numeric_matches = integer_like & numeric_values.between(0, 7)
+        text_matches = text_values.str.fullmatch(
+            r"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|"
+            r"Mon|Tue|Wed|Thu|Fri|Sat|Sun|星期[一二三四五六日天]|周[一二三四五六日天])",
+            case=False,
+            na=False,
+        )
+        matches = numeric_matches | text_matches
+    else:
+        return False
+
+    return bool(matches.mean() >= 0.8)
+
+
+def is_derived_time_column(column_name, series):
+    """Return whether name and values describe a partial time component."""
+    component_kind = _derived_time_component_kind(column_name)
+    return bool(
+        component_kind
+        and _matches_derived_time_values(series, component_kind)
+    )
+
+
+def get_invalid_exploration_datetime_confirmations(
+    df,
+    confirmed_type_by_column,
+):
+    """Return partial time fields incorrectly confirmed as complete datetimes."""
+    confirmed_types = dict(confirmed_type_by_column or {})
+    datetime_confirmation_types = {"datetime", "日期字段", "时间字段"}
+    return [
+        column
+        for column in df.columns
+        if confirmed_types.get(column) in datetime_confirmation_types
+        and is_derived_time_column(column, df[column])
+    ]
 
 
 def build_exploration_field_roles(
@@ -135,13 +195,16 @@ def build_exploration_field_roles(
         else:
             confirmed_type = confirmed_type_by_column.get(column)
             confirmed_role = _CONFIRMED_TYPE_TO_ROLE.get(confirmed_type)
-            if confirmed_role is not None:
+            is_derived_time = is_derived_time_column(column, series)
+            if confirmed_role == "datetime" and is_derived_time:
+                role = "derived_time"
+            elif confirmed_role is not None:
                 role = confirmed_role
                 if role == "unsupported":
                     unsupported_reason = "人工确认排除字段"
             elif column in identifier_columns:
                 role = "identifier"
-            elif is_derived_time_column(column, series):
+            elif is_derived_time:
                 role = "derived_time"
             elif column in datetime_columns or pd.api.types.is_datetime64_any_dtype(
                 series.dtype
