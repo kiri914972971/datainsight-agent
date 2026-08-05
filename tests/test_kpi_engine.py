@@ -37,6 +37,10 @@ class KpiEngineTests(unittest.TestCase):
 
         self.assertEqual(by_name["销售额"]["aggregation"], "sum")
         self.assertEqual(by_name["销售额"]["source_field"], "成交金额")
+        self.assertEqual(by_name["销售额"]["lifecycle_status"], "candidate")
+        self.assertFalse(by_name["销售额"]["enabled"])
+        self.assertEqual(by_name["销售额"]["validation_status"], "pending")
+        self.assertTrue(by_name["销售额"]["validation_messages"])
         self.assertEqual(by_name["订单数"]["aggregation"], "count")
         self.assertEqual(by_name["客户数"]["aggregation"], "count")
         self.assertEqual(by_name["同比"]["category"], "时间指标")
