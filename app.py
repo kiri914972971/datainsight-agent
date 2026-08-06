@@ -59,7 +59,10 @@ from src.engines.kpi_engine import (
     resolve_kpi_source_selection,
     missing_entity_id_candidate_names,
 )
-from src.engines.metric_dictionary_engine import METRIC_CATEGORIES
+from src.engines.metric_dictionary_engine import (
+    METRIC_CATEGORIES,
+    build_metric_formula_summary,
+)
 from src.engines.analysis_engine import execute_analysis
 from src.engines.business_analysis_engine import generate_business_analysis as generate_rule_business_analysis
 from src.engines.eda_engine import generate_eda_report
@@ -254,12 +257,11 @@ from src.services.kpi_service import (
     summarize_kpi_center,
 )
 from src.services.metric_dictionary_service import (
-    add_metric_definition,
     delete_metric_definition,
     generate_project_metric_candidates,
-    list_enabled_metrics,
+    get_metric_dictionary_view,
+    list_usable_metrics,
     load_metric_dictionary,
-    merged_project_metrics,
     save_metric_dictionary,
 )
 from src.services.relationship_service import (
@@ -4430,16 +4432,20 @@ def render_metric_dictionary_tab(project_id: str, show_intro: bool = True) -> No
             "book-open",
             "Business Metric Dictionary",
             "指标语义字典",
-            "把不同企业、不同表里的字段叫法统一成项目级业务指标，并关联到 KPI 定义。",
+            "维护已保存指标的业务定义、别名和业务称呼。",
         )
-        st.info(
-            "指标语义字典用于维护已保存指标的业务定义和别名。指标是否可供下游使用，仍由其保存、启用和校验状态共同决定。"
-        )
+    st.info(
+        "指标语义字典用于维护已保存指标的业务定义、别名和业务称呼。"
+        "指标的来源字段、聚合方式和计算公式请前往【指标计算规则】维护。"
+    )
+    st.caption(
+        "语义定义不会创建新的计算指标；只有关联有效计算规则的语义定义才能供后续功能使用。"
+    )
 
     try:
         existing_metrics = load_metric_dictionary(project_id)
         candidate_metrics = generate_project_metric_candidates(project_id)
-        current_metrics = merged_project_metrics(project_id)
+        current_metrics = get_metric_dictionary_view(project_id)
         project_kpis = load_kpi_definitions(project_id)
     except ValueError as exc:
         st.error(str(exc))
@@ -4448,41 +4454,11 @@ def render_metric_dictionary_tab(project_id: str, show_intro: bool = True) -> No
         current_metrics = []
         project_kpis = []
 
-    no_linked_rule_label = "不关联指标计算规则"
-    saved_kpi_options = [no_linked_rule_label] + _unique_values(
-        [str(item.get("kpi_name", "")) for item in project_kpis if item.get("kpi_name")]
-    )
-    historical_linked_kpis = _unique_values(
-        [
-            str(item.get("linked_kpi_name", ""))
-            for item in existing_metrics
-            if item.get("linked_kpi_name")
-        ]
-    )
-    kpi_options = saved_kpi_options + [
-        name for name in historical_linked_kpis if name not in saved_kpi_options
-    ]
-    kpi_id_by_name = {
-        str(item.get("kpi_name", "")): str(item.get("kpi_id", ""))
-        for item in project_kpis
-        if item.get("kpi_name")
-    }
-    kpi_id_by_name.update(
-        {
-            str(item.get("linked_kpi_name", "")): str(
-                item.get("linked_kpi_id", "")
-            )
-            for item in existing_metrics
-            if item.get("linked_kpi_name")
-        }
-    )
     project_kpi_by_id = {
         str(item.get("kpi_id", "")): item for item in project_kpis
     }
-    formula_by_kpi_id = {
-        kpi_id: format_kpi_source_or_formula(item, project_kpi_by_id)
-        for kpi_id, item in project_kpi_by_id.items()
-        if item.get("aggregation") == "ratio"
+    current_metric_by_id = {
+        str(item.get("metric_id", "")): item for item in current_metrics
     }
 
     summary_columns = st.columns(4)
@@ -4491,153 +4467,133 @@ def render_metric_dictionary_tab(project_id: str, show_intro: bool = True) -> No
     summary_columns[2].metric("自动候选", len(candidate_metrics))
     summary_columns[3].metric("别名数量", sum(len(item.get("aliases", [])) for item in current_metrics))
 
-    if not project_kpis:
-        st.info(
-            "当前尚未保存指标计算规则。请先在【指标计算规则】中确认并保存指标，再维护指标业务定义和别名。"
-        )
-        if existing_metrics:
-            st.caption("已有指标语义定义会继续保留，但其关联 KPI 可能已不存在，请逐项检查。")
-
-    st.subheader("指标语义字典")
-    st.caption("这里管理指标“叫什么”：业务定义、别名、指标类型，以及关联哪条指标计算规则。")
-    metric_rows = pd.DataFrame(
-        [
-            {
-                "_metric_id": item["metric_id"],
-                "启用状态": bool(item["enabled"]),
-                "指标名称": item["metric_name"],
-                "指标类型": item["metric_type"],
-                "业务定义": item["business_definition"],
-                "计算公式": (
-                    formula_by_kpi_id.get(str(item.get("linked_kpi_id", "")), "")
-                    or item.get("formula_summary", "")
-                    or "—"
-                ),
-                "别名": "，".join(item.get("aliases", [])),
-                "关联指标计算规则": item.get("linked_kpi_name") or no_linked_rule_label,
-                "创建方式": "自动候选" if item.get("created_by") == "auto" else "用户定义",
-            }
-            for item in current_metrics
-        ],
-        columns=[
-            "_metric_id",
-            "启用状态",
-            "指标名称",
-            "指标类型",
-            "业务定义",
-            "计算公式",
-            "别名",
-            "关联指标计算规则",
-            "创建方式",
-        ],
-    )
-    edited_rows = st.data_editor(
-        metric_rows,
-        use_container_width=True,
-        hide_index=True,
-        column_order=["指标名称", "指标类型", "业务定义", "计算公式", "别名", "关联指标计算规则", "启用状态", "创建方式"],
-        disabled=["计算公式", "创建方式"],
-        column_config={
-            "启用状态": st.column_config.CheckboxColumn("启用状态"),
-            "指标类型": st.column_config.SelectboxColumn("指标类型", options=list(METRIC_CATEGORIES)),
-            "关联指标计算规则": st.column_config.SelectboxColumn("关联指标计算规则", options=kpi_options),
-            "别名": st.column_config.TextColumn(
-                "别名",
-                help="多个别名可用逗号、顿号、分号或换行分隔，例如 GMV，Revenue，成交金额。",
-            ),
-        },
-        key=f"metric_dictionary_editor_{project_id}",
-    )
-
-    if st.button("保存指标语义字典", type="primary", key=f"save_metric_dictionary_{project_id}"):
-        metrics = []
-        for index, row in enumerate(edited_rows.to_dict("records")):
-            original_item = current_metrics[index] if index < len(current_metrics) else {}
-            linked_kpi_name = "" if row["关联指标计算规则"] == no_linked_rule_label else row["关联指标计算规则"]
-            metrics.append(
-                {
-                    "metric_id": row.get("_metric_id") or original_item.get("metric_id"),
-                    "metric_name": row["指标名称"],
-                    "metric_type": row["指标类型"],
-                    "business_definition": row["业务定义"],
-                    "formula_summary": (
-                        "" if row.get("计算公式") == "—" else row.get("计算公式", "")
-                    ),
-                    "aliases": row["别名"],
-                    "linked_kpi_name": linked_kpi_name,
-                    "linked_kpi_id": kpi_id_by_name.get(linked_kpi_name, ""),
-                    "enabled": row["启用状态"],
-                    "created_by": "auto" if row["创建方式"] == "自动候选" else "user",
-                }
-            )
-        save_metric_dictionary(project_id, metrics)
-        st.session_state.metric_dictionary_message = "指标语义字典已保存到当前项目。"
-        st.rerun()
-
-    message = st.session_state.pop("metric_dictionary_message", None)
+    message_key = f"metric_dictionary_message_{project_id}"
+    message = st.session_state.pop(message_key, None)
     if message:
         st.success(message)
 
-    st.subheader("新增指标")
-    with st.form(f"add_metric_form_{project_id}"):
-        add_columns = st.columns(4)
-        new_metric_name = add_columns[0].text_input("指标名称", placeholder="例如：销售额")
-        new_metric_type = add_columns[1].selectbox("指标类型", list(METRIC_CATEGORIES))
-        new_linked_kpi = add_columns[2].selectbox(
-            "关联指标计算规则", saved_kpi_options
+    if not project_kpis:
+        if existing_metrics:
+            st.info(
+                "当前项目没有可关联的已保存指标计算规则。以下历史语义定义已保留，但不能供下游使用。"
+            )
+        else:
+            st.info(
+                "当前尚未保存指标计算规则。请先前往【指标计算规则】确认并保存指标，再维护指标业务定义和别名。"
+            )
+    elif candidate_metrics:
+        st.info(
+            "检测到尚未维护业务语义的已保存指标。请补充业务定义和别名后保存。"
         )
-        new_enabled = add_columns[3].checkbox("启用", value=True)
-        new_definition = st.text_input("业务定义", placeholder="说明这个指标的统一业务含义")
-        new_aliases = st.text_area(
-            "别名",
-            placeholder="例如：GMV，Revenue，订单金额，成交金额",
-            height=90,
-        )
-        submitted = st.form_submit_button("新增指标", type="primary")
-        if submitted:
-            if not new_metric_name.strip():
-                st.error("指标名称不能为空。")
-            else:
-                linked_kpi_name = "" if new_linked_kpi == no_linked_rule_label else new_linked_kpi
-                add_metric_definition(
-                    project_id,
-                    {
-                        "metric_name": new_metric_name,
-                        "metric_type": new_metric_type,
-                        "business_definition": new_definition,
-                        "aliases": new_aliases,
-                        "linked_kpi_name": linked_kpi_name,
-                        "linked_kpi_id": kpi_id_by_name.get(linked_kpi_name, ""),
-                        "enabled": new_enabled,
-                        "created_by": "user",
-                    },
-                )
-                st.session_state.metric_dictionary_message = "新指标已添加。"
-                st.rerun()
 
-    st.subheader("删除指标")
+    if current_metrics:
+        st.subheader("指标语义字典")
+        st.caption("这里维护指标“是什么意思”和“有哪些别名”；计算规则及关联关系在【指标计算规则】中维护。")
+        metric_rows = pd.DataFrame(
+            [
+                {
+                    "_metric_id": item["metric_id"],
+                    "指标名称": item["metric_name"],
+                    "指标类型": item["metric_type"],
+                    "业务定义": item["business_definition"],
+                    "计算公式": (
+                        build_metric_formula_summary(
+                            project_kpi_by_id[item["linked_kpi_id"]],
+                            project_kpi_by_id,
+                        )
+                        if item.get("linked_kpi_id") in project_kpi_by_id
+                        else item.get("formula_summary", "") or "—"
+                    ),
+                    "别名": "，".join(item.get("aliases", [])),
+                    "关联指标计算规则": item.get("linked_kpi_name") or "—",
+                    "关联状态": item["association_status"],
+                    "启用状态": bool(item["enabled"]),
+                }
+                for item in current_metrics
+            ]
+        )
+        edited_rows = st.data_editor(
+            metric_rows,
+            use_container_width=True,
+            hide_index=True,
+            height=calculate_dataframe_height(len(metric_rows)),
+            column_order=[
+                "指标名称",
+                "指标类型",
+                "业务定义",
+                "计算公式",
+                "别名",
+                "关联指标计算规则",
+                "关联状态",
+                "启用状态",
+            ],
+            disabled=["计算公式", "关联指标计算规则", "关联状态"],
+            column_config={
+                "启用状态": st.column_config.CheckboxColumn("启用状态"),
+                "指标类型": st.column_config.SelectboxColumn(
+                    "指标类型", options=list(METRIC_CATEGORIES)
+                ),
+                "别名": st.column_config.TextColumn(
+                    "别名",
+                    help="多个别名可用逗号、顿号、分号或换行分隔，例如 GMV，Revenue，成交金额。",
+                ),
+            },
+            key=f"metric_dictionary_editor_{project_id}",
+        )
+
+        if st.button(
+            "保存指标语义字典",
+            type="primary",
+            key=f"save_metric_dictionary_{project_id}",
+        ):
+            metrics = []
+            for row in edited_rows.to_dict("records"):
+                original_item = current_metric_by_id.get(
+                    str(row.get("_metric_id", "")), {}
+                )
+                metrics.append(
+                    {
+                        **original_item,
+                        "metric_id": row.get("_metric_id")
+                        or original_item.get("metric_id"),
+                        "metric_name": row["指标名称"],
+                        "metric_type": row["指标类型"],
+                        "business_definition": row["业务定义"],
+                        "formula_summary": (
+                            ""
+                            if row.get("计算公式") == "—"
+                            else row.get("计算公式", "")
+                        ),
+                        "aliases": row["别名"],
+                        "enabled": row["启用状态"],
+                    }
+                )
+            save_metric_dictionary(project_id, metrics)
+            st.session_state[message_key] = "指标语义字典已保存到当前项目。"
+            st.rerun()
+
     saved_metrics = load_metric_dictionary(project_id)
     if saved_metrics:
+        st.subheader("删除指标语义定义")
         delete_options = {
             item["metric_id"]: f"{item['metric_name']} · {item.get('metric_type', '核心指标')}"
             for item in saved_metrics
         }
         delete_metric_id = st.selectbox(
-            "选择要删除的指标",
+            "选择要删除的指标语义定义",
             list(delete_options),
             format_func=lambda value: delete_options[value],
             key=f"delete_metric_select_{project_id}",
         )
-        if st.button("删除所选指标", key=f"delete_metric_{project_id}"):
+        if st.button("删除所选指标语义定义", key=f"delete_metric_{project_id}"):
             delete_metric_definition(project_id, delete_metric_id)
-            st.session_state.metric_dictionary_message = "指标已删除。"
+            st.session_state[message_key] = "指标语义定义已删除。"
             st.rerun()
-    else:
-        st.info("当前还没有已保存的指标。保存候选或新增指标后，可在这里删除。")
 
-    enabled_metrics = list_enabled_metrics(project_id)
+    usable_metrics = list_usable_metrics(project_id)
     st.caption(
-        f"指标语义字典保存在 config/metric_dictionary.json，并同步写入 project.json。当前启用 {len(enabled_metrics)} 个业务指标。"
+        "指标语义字典保存在 config/metric_dictionary.json，并同步写入 project.json。"
+        f"当前有 {len(usable_metrics)} 个语义定义可供后续功能使用。"
     )
 
 

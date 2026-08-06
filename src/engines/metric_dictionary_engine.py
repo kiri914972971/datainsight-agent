@@ -6,6 +6,10 @@ from typing import Any
 
 
 METRIC_CATEGORIES = ("核心指标", "时间指标", "维度指标")
+METRIC_ASSOCIATION_ACTIVE = "关联正常"
+METRIC_ASSOCIATION_INVALID = "关联规则已失效"
+METRIC_ASSOCIATION_LEGACY = "未关联历史定义"
+METRIC_ASSOCIATION_CANDIDATE = "待保存语义候选"
 
 DEFAULT_METRIC_ALIASES = {
     "销售额": ["GMV", "Revenue", "Sales", "销售额", "成交金额", "订单金额", "收入"],
@@ -32,8 +36,8 @@ def generate_metric_candidates_from_kpis(
         if isinstance(item, dict) and item.get("kpi_id")
     }
     for kpi in kpis or []:
-        lifecycle_status = str(kpi.get("lifecycle_status", "saved")).strip()
-        if lifecycle_status and lifecycle_status != "saved":
+        lifecycle_status = str(kpi.get("lifecycle_status", "")).strip().lower()
+        if lifecycle_status != "saved":
             continue
         kpi_name = str(kpi.get("kpi_name", "")).strip()
         if not kpi_name:
@@ -41,10 +45,11 @@ def generate_metric_candidates_from_kpis(
         candidates.append(
             normalize_metric_definition(
                 {
+                    "metric_id": _candidate_metric_id(str(kpi.get("kpi_id", ""))),
                     "metric_name": kpi_name,
                     "metric_type": _metric_type_from_kpi(kpi),
                     "business_definition": _default_definition(kpi, kpi_by_id),
-                    "formula_summary": _formula_summary(kpi, kpi_by_id),
+                    "formula_summary": build_metric_formula_summary(kpi, kpi_by_id),
                     "aliases": _default_aliases(kpi),
                     "linked_kpi_id": str(kpi.get("kpi_id", "")),
                     "linked_kpi_name": kpi_name,
@@ -61,15 +66,99 @@ def merge_metric_candidates(
     candidates: list[dict[str, Any]] | None,
 ) -> list[dict[str, Any]]:
     """Preserve user-defined metric records while adding new KPI-derived candidates."""
-    merged = {
-        _metric_key(item): normalize_metric_definition(item)
+    merged = [
+        normalize_metric_definition(item)
         for item in existing_metrics or []
         if item.get("metric_name")
+    ]
+    linked_kpi_ids = {
+        item["linked_kpi_id"] for item in merged if item.get("linked_kpi_id")
     }
     for candidate in candidates or []:
         normalized = normalize_metric_definition(candidate)
-        merged.setdefault(_metric_key(normalized), normalized)
-    return list(merged.values())
+        linked_kpi_id = normalized.get("linked_kpi_id", "")
+        if linked_kpi_id and linked_kpi_id in linked_kpi_ids:
+            continue
+        merged.append(normalized)
+        if linked_kpi_id:
+            linked_kpi_ids.add(linked_kpi_id)
+    return merged
+
+
+def build_metric_association_view(
+    metrics: list[dict[str, Any]] | None,
+    saved_kpis: list[dict[str, Any]] | None,
+    candidate_metric_ids: set[str] | list[str] | tuple[str, ...] | None = None,
+) -> list[dict[str, Any]]:
+    """Add derived association and usability state without mutating inputs."""
+    kpi_by_id = {
+        str(item.get("kpi_id", "")): dict(item)
+        for item in saved_kpis or []
+        if isinstance(item, dict) and item.get("kpi_id")
+    }
+    pending_ids = {str(metric_id) for metric_id in candidate_metric_ids or []}
+    result = []
+    for metric in metrics or []:
+        normalized = normalize_metric_definition(metric)
+        linked_kpi_id = normalized["linked_kpi_id"]
+        linked_kpi = kpi_by_id.get(linked_kpi_id)
+        if normalized["metric_id"] in pending_ids:
+            association_status = METRIC_ASSOCIATION_CANDIDATE
+            association_valid = True
+        elif not linked_kpi_id:
+            association_status = METRIC_ASSOCIATION_LEGACY
+            association_valid = False
+        elif (
+            linked_kpi is None
+            or str(linked_kpi.get("lifecycle_status", "")).strip().lower()
+            != "saved"
+        ):
+            association_status = METRIC_ASSOCIATION_INVALID
+            association_valid = False
+        else:
+            association_status = METRIC_ASSOCIATION_ACTIVE
+            association_valid = True
+        usable = bool(
+            normalized["enabled"]
+            and association_status == METRIC_ASSOCIATION_ACTIVE
+            and linked_kpi is not None
+            and str(linked_kpi.get("validation_status", "")).strip().lower()
+            == "valid"
+            and bool(linked_kpi.get("enabled", False))
+        )
+        result.append(
+            {
+                **normalized,
+                "association_status": association_status,
+                "association_valid": association_valid,
+                "usable": usable,
+            }
+        )
+    return result
+
+
+def build_metric_formula_summary(
+    kpi: dict[str, Any],
+    kpi_by_id: dict[str, dict[str, Any]] | None = None,
+) -> str:
+    """Return a readable KPI formula without exposing internal IDs."""
+    aggregation = str(kpi.get("aggregation", "")).strip().lower()
+    source_field = str(kpi.get("source_field", "")).strip()
+    if aggregation == "ratio":
+        return _ratio_formula_summary(kpi, kpi_by_id)
+    if aggregation == "count_rows":
+        return "记录行数"
+    labels = {
+        "sum": "求和",
+        "avg": "平均值",
+        "max": "最大值",
+        "min": "最小值",
+        "count": "非空计数",
+        "count_distinct": "去重计数",
+        "reserved": "预留规则",
+    }
+    label = labels.get(aggregation, aggregation or "未知规则")
+    return f"{label}（{source_field}）" if source_field else label
 
 
 def normalize_metric_definition(metric: dict[str, Any]) -> dict[str, Any]:
@@ -126,7 +215,7 @@ def _default_definition(
     if aggregation_value == "count":
         return f"统计字段 `{source_field}` 中非空记录的数量，不进行去重。"
     if aggregation_value == "ratio":
-        formula = _formula_summary(kpi, kpi_by_id)
+        formula = _ratio_formula_summary(kpi, kpi_by_id)
         if not formula:
             return str(kpi.get("description", "")).strip() or f"{name} 的比率指标定义"
         definition = f"{name}表示{formula.replace(' ÷ ', '除以')}。"
@@ -183,7 +272,7 @@ def _default_aliases(kpi: dict[str, Any]) -> list[str]:
     return _normalize_aliases(aliases)
 
 
-def _formula_summary(
+def _ratio_formula_summary(
     kpi: dict[str, Any],
     kpi_by_id: dict[str, dict[str, Any]] | None,
 ) -> str:
@@ -197,6 +286,13 @@ def _formula_summary(
     if not numerator_name or not denominator_name:
         return ""
     return f"{numerator_name} ÷ {denominator_name}"
+
+
+def _candidate_metric_id(linked_kpi_id: str) -> str:
+    return uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"data-insight-agent:metric-candidate:{linked_kpi_id}",
+    ).hex
 
 
 def _normalize_aliases(value: Any) -> list[str]:
@@ -226,5 +322,9 @@ def _deduplicate_metrics(metrics: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return list({_metric_key(item): item for item in metrics}.values())
 
 
-def _metric_key(metric: dict[str, Any]) -> str:
-    return _normalize_lookup(metric.get("metric_name", ""))
+def _metric_key(metric: dict[str, Any]) -> tuple[str, str]:
+    linked_kpi_id = str(metric.get("linked_kpi_id", "")).strip()
+    if linked_kpi_id:
+        return ("linked_kpi", linked_kpi_id)
+    metric_id = str(metric.get("metric_id", "")).strip()
+    return ("legacy_metric", metric_id or _normalize_lookup(metric.get("metric_name", "")))

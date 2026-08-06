@@ -94,8 +94,8 @@ def test_delete_dependency_requires_confirmation_without_cascade_delete():
 
 def test_metric_dictionary_displays_readable_formula_as_read_only():
     assert '"计算公式"' in METRIC_TAB_SOURCE
-    assert "formula_by_kpi_id" in METRIC_TAB_SOURCE
-    assert 'disabled=["计算公式", "创建方式"]' in METRIC_TAB_SOURCE
+    assert "build_metric_formula_summary(" in METRIC_TAB_SOURCE
+    assert 'disabled=["计算公式", "关联指标计算规则", "关联状态"]' in METRIC_TAB_SOURCE
 
 
 def test_ratio_ui_does_not_write_dashboard_or_report_context():
