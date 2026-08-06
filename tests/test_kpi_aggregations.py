@@ -16,6 +16,7 @@ from src.engines.kpi_engine import (
     generate_kpi_candidates,
     get_kpi_source_field_options,
     get_kpi_source_field_type,
+    is_additive_quantity_field,
     missing_entity_id_candidate_names,
     normalize_kpi_definition,
     resolve_kpi_source_selection,
@@ -25,7 +26,9 @@ from src.exploration import build_exploration_field_roles
 from src.services.field_mapping_service import save_field_mappings
 from src.services.kpi_service import (
     add_saved_kpi_definition,
+    filter_unsaved_kpi_candidates,
     list_usable_kpis,
+    save_selected_kpi_candidates,
     save_kpi_definitions,
 )
 
@@ -535,6 +538,173 @@ class KpiCountCandidateTests(unittest.TestCase):
         self.assertEqual(missing_entity_id_candidate_names(both), [])
 
 
+class KpiQuantityCandidateTests(unittest.TestCase):
+    def test_current_example_contains_amount_quantity_person_and_row_candidates(self):
+        candidates = generate_kpi_candidates(
+            [
+                {"column_name": "成交金额", "confirmed_type": "金额字段"},
+                {"column_name": "成交客户数", "confirmed_type": "数量字段"},
+                {"column_name": "销售工号", "confirmed_type": "ID字段"},
+            ]
+        )
+        by_name = {item["kpi_name"]: item for item in candidates}
+
+        self.assertEqual(by_name["销售额"]["aggregation"], "sum")
+        self.assertEqual(by_name["成交客户数"]["aggregation"], "sum")
+        self.assertEqual(
+            by_name["销售人员数"]["aggregation"], "count_distinct"
+        )
+        self.assertEqual(by_name["记录数"]["aggregation"], "count_rows")
+        self.assertNotIn("客户数", by_name)
+
+    def test_common_chinese_and_english_quantity_names_are_recognized(self):
+        names = (
+            "成交客户数",
+            "销售数量",
+            "库存数量",
+            "访问次数",
+            "商品件数",
+            "transactions",
+            "order_count",
+            "salesQty",
+        )
+
+        self.assertTrue(all(is_additive_quantity_field(name) for name in names))
+
+    def test_non_additive_and_identifier_names_are_rejected(self):
+        names = (
+            "普通数值",
+            "销售工号",
+            "订单ID",
+            "客户ID",
+            "客单价",
+            "平均订单数",
+            "avg_quantity",
+            "转化率",
+            "占比",
+            "count_rate",
+            "成交年份",
+            "成交月份",
+        )
+
+        self.assertTrue(not any(is_additive_quantity_field(name) for name in names))
+
+    def test_only_additive_numeric_fields_generate_quantity_sum_candidates(self):
+        dataframe = pd.DataFrame(
+            {
+                "成交客户数": [2, 3],
+                "销售数量": [4, 5],
+                "库存数量": [8, 9],
+                "访问次数": [10, 11],
+                "普通数值": [1.2, 2.3],
+                "销售工号": [10001, 10002],
+                "订单ID": [20001, 20002],
+                "客户ID": [30001, 30002],
+                "客单价": [50.0, 60.0],
+                "转化率": [0.1, 0.2],
+                "占比": [0.3, 0.4],
+                "成交年份": [2020, 2021],
+                "成交月份": [4, 5],
+                "固定访问次数": [1, 1],
+                "是否访问次数": [True, False],
+            }
+        )
+        mappings = [
+            {"column_name": column, "confirmed_type": "数量字段"}
+            for column in dataframe.columns
+        ]
+        for identifier in ("销售工号", "订单ID", "客户ID"):
+            next(
+                item for item in mappings if item["column_name"] == identifier
+            )["confirmed_type"] = "ID字段"
+        for time_field in ("成交年份", "成交月份"):
+            next(
+                item for item in mappings if item["column_name"] == time_field
+            )["confirmed_type"] = "日期字段"
+
+        candidates = generate_kpi_candidates(mappings, dataframe=dataframe)
+        numeric_sum_sources = {
+            item["source_field"]
+            for item in candidates
+            if item["aggregation"] == "sum" and item["field_type"] == "numeric"
+        }
+
+        self.assertEqual(
+            numeric_sum_sources,
+            {"成交客户数", "销售数量", "库存数量", "访问次数"},
+        )
+
+    def test_quantity_candidate_keeps_name_state_and_grain_guidance(self):
+        candidate = next(
+            item
+            for item in generate_kpi_candidates(
+                [{"column_name": "成交客户数", "confirmed_type": "数量字段"}],
+                dataframe=pd.DataFrame({"成交客户数": [2, 3]}),
+            )
+            if item["source_field"] == "成交客户数"
+            and item["aggregation"] == "sum"
+        )
+
+        self.assertEqual(candidate["kpi_name"], "成交客户数")
+        self.assertEqual(candidate["field_type"], "numeric")
+        self.assertEqual(candidate["category"], "核心指标")
+        self.assertEqual(candidate["lifecycle_status"], "candidate")
+        self.assertFalse(candidate["enabled"])
+        self.assertEqual(candidate["validation_status"], "pending")
+        self.assertIn("数据合并或重复展开", candidate["description"])
+
+    def test_amount_source_has_only_one_sum_candidate(self):
+        mapping = {"column_name": "成交数量金额", "confirmed_type": "金额字段"}
+        candidates = generate_kpi_candidates(
+            [mapping, dict(mapping)],
+            dataframe=pd.DataFrame({"成交数量金额": [100.0, 200.0]}),
+        )
+
+        sum_candidates = [
+            item
+            for item in candidates
+            if item["aggregation"] == "sum"
+            and item["source_field"] == "成交数量金额"
+        ]
+        self.assertEqual(len(sum_candidates), 1)
+        self.assertEqual(sum_candidates[0]["field_type"], "amount")
+
+    def test_duplicate_quantity_mappings_do_not_duplicate_source_sum(self):
+        mapping = {"column_name": "销售数量", "confirmed_type": "数量字段"}
+        candidates = generate_kpi_candidates([mapping, dict(mapping)])
+
+        self.assertEqual(
+            len(
+                [
+                    item
+                    for item in candidates
+                    if item["aggregation"] == "sum"
+                    and item["source_field"] == "销售数量"
+                ]
+            ),
+            1,
+        )
+
+    def test_saved_same_quantity_kpi_is_filtered_from_candidates(self):
+        candidates = generate_kpi_candidates(
+            [{"column_name": "销售数量", "confirmed_type": "数量字段"}]
+        )
+        quantity_candidate = next(
+            item for item in candidates if item["source_field"] == "销售数量"
+        )
+        saved = {
+            **quantity_candidate,
+            "lifecycle_status": "saved",
+            "enabled": True,
+        }
+
+        remaining = filter_unsaved_kpi_candidates([saved], candidates)
+
+        self.assertFalse(
+            any(item["source_field"] == "销售数量" for item in remaining)
+        )
+
+
 class KpiAggregationServiceTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -615,6 +785,48 @@ class KpiAggregationServiceTests(unittest.TestCase):
 
         self.assertEqual(saved[0]["aggregation"], "count")
         self.assertEqual(original, before)
+
+    def test_quantity_candidate_saves_valid_enabled_and_expires_with_field(self):
+        save_field_mappings(
+            self.project["project_id"],
+            [{"column_name": "成交客户数", "confirmed_type": "数量字段"}],
+        )
+        candidate = next(
+            item
+            for item in generate_kpi_candidates(
+                [{"column_name": "成交客户数", "confirmed_type": "数量字段"}],
+                dataframe=pd.DataFrame({"成交客户数": [2, 3]}),
+            )
+            if item["source_field"] == "成交客户数"
+        )
+
+        result = save_selected_kpi_candidates(
+            self.project["project_id"],
+            [candidate],
+            available_fields=["成交客户数"],
+        )
+        saved = result["saved"][0]
+
+        self.assertEqual(saved["lifecycle_status"], "saved")
+        self.assertEqual(saved["validation_status"], "valid")
+        self.assertTrue(saved["enabled"])
+        self.assertEqual(
+            [
+                item["kpi_name"]
+                for item in list_usable_kpis(
+                    self.project["project_id"],
+                    available_fields=["成交客户数"],
+                )
+            ],
+            ["成交客户数"],
+        )
+        self.assertEqual(
+            list_usable_kpis(
+                self.project["project_id"],
+                available_fields=[],
+            ),
+            [],
+        )
 
 
 if __name__ == "__main__":

@@ -151,6 +151,12 @@ def test_missing_id_candidate_guidance_uses_complete_generated_candidates():
     assert "‘成交客户数’通常应按业务定义求和，而不是去重计数" in KPI_TAB_SOURCE
 
 
+def test_quantity_sum_candidate_area_explains_dataset_grain_boundary():
+    assert "数量字段的求和结果依赖当前分析数据集粒度" in KPI_TAB_SOURCE
+    assert "一对多合并或重复展开" in KPI_TAB_SOURCE
+    assert "请在保存前确认口径" in KPI_TAB_SOURCE
+
+
 def test_legacy_count_has_non_migration_guidance():
     assert "已保存规则中存在非空计数指标" in KPI_TAB_SOURCE
     assert "请将聚合方式改为去重计数" in KPI_TAB_SOURCE

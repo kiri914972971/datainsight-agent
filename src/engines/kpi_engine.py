@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import math
+import re
 import uuid
 from typing import Any
 
 import pandas as pd
 
-from src.exploration import is_derived_time_column
+from src.exploration import build_exploration_field_roles, is_derived_time_column
 
 
 SUPPORTED_AGGREGATIONS = (
@@ -65,6 +66,99 @@ _FIELD_TYPE_ALIASES = {
     "row": "row",
     "dataset": "dataset",
 }
+
+_QUANTITY_NAME_KEYWORDS_ZH = (
+    "数量",
+    "人数",
+    "客户数",
+    "订单数",
+    "件数",
+    "销量",
+    "次数",
+    "访问数",
+    "库存数",
+    "成交数",
+    "交易数",
+    "投诉数",
+    "退款数",
+)
+_QUANTITY_NAME_KEYWORDS_EN = {
+    "count",
+    "quantity",
+    "qty",
+    "units",
+    "volume",
+    "visits",
+    "customers",
+    "orders",
+    "transactions",
+}
+_NON_ADDITIVE_NAME_KEYWORDS_ZH = (
+    "转化率",
+    "退款率",
+    "占比",
+    "比例",
+    "增长率",
+    "百分比",
+    "客单价",
+    "单价",
+    "均价",
+    "平均",
+    "人均",
+)
+_NON_ADDITIVE_NAME_KEYWORDS_EN = {
+    "percentage",
+    "percent",
+    "pct",
+    "ratio",
+    "rate",
+    "share",
+    "average",
+    "avg",
+    "mean",
+    "price",
+}
+_IDENTIFIER_NAME_KEYWORDS_ZH = ("工号", "编号", "编码")
+_IDENTIFIER_NAME_KEYWORDS_EN = {"id", "code", "key"}
+_TIME_COMPONENT_NAME_KEYWORDS_ZH = ("年", "年份", "月", "月份", "季度", "星期", "周几", "日期")
+_TIME_COMPONENT_NAME_KEYWORDS_EN = {
+    "year",
+    "month",
+    "quarter",
+    "weekday",
+    "week_day",
+    "date",
+}
+
+
+def is_additive_quantity_field(column_name: str) -> bool:
+    """Return whether a field name clearly describes an additive quantity."""
+    raw_name = str(column_name or "").strip()
+    if not raw_name:
+        return False
+    compact_name = re.sub(r"[\s_\-]+", "", raw_name).casefold()
+    tokens = set(_field_name_tokens(raw_name))
+
+    if any(keyword in compact_name for keyword in _NON_ADDITIVE_NAME_KEYWORDS_ZH):
+        return False
+    if tokens & _NON_ADDITIVE_NAME_KEYWORDS_EN:
+        return False
+    if any(keyword in compact_name for keyword in _IDENTIFIER_NAME_KEYWORDS_ZH):
+        return False
+    if tokens & _IDENTIFIER_NAME_KEYWORDS_EN:
+        return False
+
+    has_quantity_semantics = any(
+        keyword in compact_name for keyword in _QUANTITY_NAME_KEYWORDS_ZH
+    ) or bool(tokens & _QUANTITY_NAME_KEYWORDS_EN)
+    if not has_quantity_semantics:
+        return False
+
+    if compact_name in _TIME_COMPONENT_NAME_KEYWORDS_ZH:
+        return False
+    if tokens and tokens.issubset(_TIME_COMPONENT_NAME_KEYWORDS_EN):
+        return False
+    return True
 
 
 def get_kpi_source_field_type(
@@ -191,7 +285,8 @@ def generate_kpi_candidates(
         for item in field_mappings or []
         if item.get("column_name") and item.get("confirmed_type") != "忽略字段"
     ]
-    amount_fields = _columns_by_type(mappings, "金额字段")
+    amount_fields = list(dict.fromkeys(_columns_by_type(mappings, "金额字段")))
+    quantity_fields = _additive_quantity_fields(mappings, dataframe)
     id_fields = _columns_by_type(mappings, "ID字段")
     date_fields = [
         field
@@ -239,6 +334,26 @@ def generate_kpi_candidates(
                 enabled=False,
             )
         )
+
+    existing_sum_sources = set(amount_fields)
+    for field in quantity_fields:
+        if field in existing_sum_sources:
+            continue
+        candidates.append(
+            _kpi(
+                kpi_name=field,
+                aggregation="sum",
+                source_field=field,
+                field_type="numeric",
+                category="核心指标",
+                description=(
+                    f"根据数量字段 `{field}` 推荐求和指标。"
+                    "请确认当前数据集粒度，数据合并或重复展开可能导致数量被重复累计。"
+                ),
+                enabled=False,
+            )
+        )
+        existing_sum_sources.add(field)
 
     for field in id_fields:
         candidates.append(
@@ -636,6 +751,76 @@ def _columns_by_type(mappings: list[dict[str, Any]], field_type: str) -> list[st
         for item in mappings
         if item.get("confirmed_type") == field_type
     ]
+
+
+def _additive_quantity_fields(
+    mappings: list[dict[str, Any]],
+    dataframe: pd.DataFrame | None,
+) -> list[str]:
+    mapping_by_column = _mapping_by_column(mappings)
+    role_by_column: dict[str, str] = {}
+    if isinstance(dataframe, pd.DataFrame):
+        confirmed_types = {
+            column: mapping.get("confirmed_type")
+            for column, mapping in mapping_by_column.items()
+            if column in dataframe.columns
+        }
+        role_by_column = build_exploration_field_roles(
+            dataframe,
+            confirmed_type_by_column=confirmed_types,
+        )["role_by_column"]
+        candidate_fields = [str(column) for column in dataframe.columns]
+    else:
+        candidate_fields = list(mapping_by_column)
+
+    quantity_fields = []
+    for field in candidate_fields:
+        mapping = mapping_by_column.get(field, {})
+        mapped_type = _FIELD_TYPE_ALIASES.get(
+            str(
+                mapping.get("confirmed_type")
+                or mapping.get("inferred_type")
+                or ""
+            ).strip(),
+            "",
+        )
+        role = role_by_column.get(field)
+        if mapped_type == "amount":
+            continue
+        if mapped_type in {"id", "date", "row", "dataset"}:
+            continue
+        if role in {
+            "identifier",
+            "datetime",
+            "derived_time",
+            "constant",
+            "boolean",
+            "unsupported",
+        }:
+            continue
+        if role != "numeric" and mapped_type != "numeric":
+            continue
+        if isinstance(dataframe, pd.DataFrame) and field in dataframe.columns:
+            series = dataframe[field]
+            if (
+                pd.api.types.is_bool_dtype(series.dtype)
+                or series.dropna().empty
+                or series.nunique(dropna=True) <= 1
+                or is_derived_time_column(field, series)
+            ):
+                continue
+        if is_additive_quantity_field(field):
+            quantity_fields.append(field)
+    return list(dict.fromkeys(quantity_fields))
+
+
+def _field_name_tokens(column_name: str) -> list[str]:
+    with_camel_boundaries = re.sub(
+        r"(?<=[a-z0-9])(?=[A-Z])",
+        " ",
+        str(column_name or ""),
+    )
+    return re.findall(r"[a-z0-9]+", with_camel_boundaries.casefold())
 
 
 def _is_derived_time_mapping(

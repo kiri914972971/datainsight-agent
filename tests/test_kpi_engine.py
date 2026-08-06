@@ -23,8 +23,10 @@ class KpiEngineTests(unittest.TestCase):
     def setUp(self):
         self.mappings = [
             {"column_name": "成交金额", "confirmed_type": "金额字段"},
+            {"column_name": "成交客户数", "confirmed_type": "数量字段"},
             {"column_name": "订单ID", "confirmed_type": "ID字段"},
             {"column_name": "客户ID", "confirmed_type": "ID字段"},
+            {"column_name": "销售工号", "confirmed_type": "ID字段"},
             {"column_name": "成交日期", "confirmed_type": "日期字段"},
             {"column_name": "区域", "confirmed_type": "区域字段"},
             {"column_name": "产品", "confirmed_type": "产品字段"},
@@ -37,12 +39,19 @@ class KpiEngineTests(unittest.TestCase):
 
         self.assertEqual(by_name["销售额"]["aggregation"], "sum")
         self.assertEqual(by_name["销售额"]["source_field"], "成交金额")
+        self.assertEqual(by_name["成交客户数"]["aggregation"], "sum")
+        self.assertEqual(by_name["成交客户数"]["source_field"], "成交客户数")
+        self.assertEqual(by_name["成交客户数"]["field_type"], "numeric")
         self.assertEqual(by_name["销售额"]["lifecycle_status"], "candidate")
         self.assertFalse(by_name["销售额"]["enabled"])
         self.assertEqual(by_name["销售额"]["validation_status"], "pending")
         self.assertTrue(by_name["销售额"]["validation_messages"])
-        self.assertEqual(by_name["订单数"]["aggregation"], "count")
-        self.assertEqual(by_name["客户数"]["aggregation"], "count")
+        self.assertEqual(by_name["订单数"]["aggregation"], "count_distinct")
+        self.assertEqual(by_name["客户数"]["aggregation"], "count_distinct")
+        self.assertEqual(by_name["销售人员数"]["aggregation"], "count_distinct")
+        self.assertEqual(by_name["记录数"]["aggregation"], "count_rows")
+        self.assertEqual(by_name["记录数"]["source_field"], "")
+        self.assertIn("不等同于订单数", by_name["记录数"]["description"])
         self.assertEqual(by_name["同比"]["category"], "时间指标")
         self.assertFalse(by_name["同比"]["enabled"])
         self.assertEqual(by_name["区域销售额"]["category"], "维度指标")

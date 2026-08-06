@@ -107,7 +107,29 @@ def _metric_type_from_kpi(kpi: dict[str, Any]) -> str:
 def _default_definition(kpi: dict[str, Any]) -> str:
     name = str(kpi.get("kpi_name", "")).strip()
     source_field = str(kpi.get("source_field", "")).strip()
-    aggregation = str(kpi.get("aggregation", "")).upper()
+    aggregation_value = str(kpi.get("aggregation", "")).strip().lower()
+    aggregation = aggregation_value.upper()
+    if aggregation_value == "count_rows":
+        return "统计当前分析数据集的记录行数。"
+    if aggregation_value == "count_distinct":
+        return f"统计字段 `{source_field}` 中非空唯一值的数量。"
+    if aggregation_value == "count":
+        return f"统计字段 `{source_field}` 中非空记录的数量，不进行去重。"
+    if aggregation_value == "sum" and str(kpi.get("field_type", "")).strip() in {
+        "numeric",
+        "number",
+        "quantity",
+        "数量字段",
+    }:
+        if any(
+            keyword in source_field.casefold()
+            for keyword in ("客户", "customer")
+        ):
+            return (
+                f"统计当前分析范围内字段 `{source_field}` 的合计值。"
+                "该口径取决于当前数据粒度，不代表客户 ID 去重数量。"
+            )
+        return f"统计字段 `{source_field}` 的合计值。"
     if name == "销售额":
         return "统计订单成交金额总和"
     if name == "订单数":

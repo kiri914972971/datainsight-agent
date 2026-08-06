@@ -76,6 +76,73 @@ class MetricDictionaryEngineTests(unittest.TestCase):
 
         self.assertEqual(generate_metric_candidates_from_kpis([candidate]), [])
 
+    def test_count_aggregations_generate_distinct_business_definitions(self):
+        kpis = [
+            {
+                "kpi_id": "rows",
+                "kpi_name": "记录数",
+                "aggregation": "count_rows",
+                "source_field": "",
+                "field_type": "row",
+                "category": "核心指标",
+                "lifecycle_status": "saved",
+            },
+            {
+                "kpi_id": "non-null",
+                "kpi_name": "非空订单ID数",
+                "aggregation": "count",
+                "source_field": "订单ID",
+                "field_type": "id",
+                "category": "核心指标",
+                "lifecycle_status": "saved",
+            },
+            {
+                "kpi_id": "distinct",
+                "kpi_name": "订单数",
+                "aggregation": "count_distinct",
+                "source_field": "订单ID",
+                "field_type": "id",
+                "category": "核心指标",
+                "lifecycle_status": "saved",
+            },
+        ]
+
+        by_name = {
+            item["metric_name"]: item
+            for item in generate_metric_candidates_from_kpis(kpis)
+        }
+
+        self.assertEqual(
+            by_name["记录数"]["business_definition"],
+            "统计当前分析数据集的记录行数。",
+        )
+        self.assertIn("非空记录", by_name["非空订单ID数"]["business_definition"])
+        self.assertIn("不进行去重", by_name["非空订单ID数"]["business_definition"])
+        self.assertIn("非空唯一值", by_name["订单数"]["business_definition"])
+
+    def test_quantity_sum_uses_grain_aware_non_distinct_definition(self):
+        candidate = generate_metric_candidates_from_kpis(
+            [
+                {
+                    "kpi_id": "quantity-customers",
+                    "kpi_name": "成交客户数",
+                    "aggregation": "sum",
+                    "source_field": "成交客户数",
+                    "field_type": "numeric",
+                    "category": "核心指标",
+                    "lifecycle_status": "saved",
+                    "enabled": True,
+                }
+            ]
+        )[0]
+
+        self.assertIn("字段 `成交客户数` 的合计值", candidate["business_definition"])
+        self.assertIn("取决于当前数据粒度", candidate["business_definition"])
+        self.assertIn("不代表客户 ID 去重数量", candidate["business_definition"])
+        self.assertNotIn("唯一客户数", candidate["aliases"])
+        self.assertNotIn("去重客户数", candidate["aliases"])
+        self.assertNotIn("Unique Customers", candidate["aliases"])
+
 
 class MetricDictionaryServiceTests(unittest.TestCase):
     def setUp(self):
