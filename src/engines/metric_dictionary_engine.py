@@ -115,6 +115,8 @@ def _default_definition(kpi: dict[str, Any]) -> str:
         return f"统计字段 `{source_field}` 中非空唯一值的数量。"
     if aggregation_value == "count":
         return f"统计字段 `{source_field}` 中非空记录的数量，不进行去重。"
+    if aggregation_value == "ratio":
+        return str(kpi.get("description", "")).strip() or f"{name} 的比率指标定义"
     if aggregation_value == "sum" and str(kpi.get("field_type", "")).strip() in {
         "numeric",
         "number",

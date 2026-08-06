@@ -18,7 +18,9 @@ SUPPORTED_AGGREGATIONS = (
     "avg",
     "max",
     "min",
+    "ratio",
 )
+BASIC_KPI_AGGREGATIONS = frozenset(SUPPORTED_AGGREGATIONS) - {"ratio"}
 RESERVED_AGGREGATION = "reserved"
 AGGREGATION_LABELS = {
     "sum": "求和",
@@ -28,6 +30,7 @@ AGGREGATION_LABELS = {
     "avg": "平均值",
     "max": "最大值",
     "min": "最小值",
+    "ratio": "比率",
     "reserved": "预留能力",
 }
 AGGREGATION_HELP_TEXTS = {
@@ -430,6 +433,8 @@ def normalize_kpi_definition(
     lifecycle_status: str | None = None,
     available_fields: list[str] | tuple[str, ...] | set[str] | None = None,
     field_mappings: list[dict[str, Any]] | None = None,
+    saved_kpis: list[dict[str, Any]] | None = None,
+    kpi_by_id: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Return a JSON-safe KPI definition without mutating the input."""
     source = dict(kpi) if isinstance(kpi, dict) else {}
@@ -451,11 +456,16 @@ def normalize_kpi_definition(
     if resolved_lifecycle_status == "candidate":
         enabled = False
 
+    source_field = str(source.get("source_field", "")).strip()
+    if aggregation == "ratio":
+        source_field = ""
     normalized = {
         "kpi_id": str(source.get("kpi_id") or uuid.uuid4().hex),
         "kpi_name": str(source.get("kpi_name", "")).strip(),
         "aggregation": aggregation,
-        "source_field": str(source.get("source_field", "")).strip(),
+        "source_field": source_field,
+        "numerator_kpi_id": str(source.get("numerator_kpi_id") or "").strip(),
+        "denominator_kpi_id": str(source.get("denominator_kpi_id") or "").strip(),
         "field_type": str(source.get("field_type", "custom")).strip() or "custom",
         "category": category,
         "description": str(source.get("description", "")).strip(),
@@ -471,6 +481,8 @@ def normalize_kpi_definition(
             normalized,
             available_fields=available_fields,
             field_mappings=field_mappings,
+            saved_kpis=saved_kpis,
+            kpi_by_id=kpi_by_id,
         )
     )
     return normalized
@@ -480,6 +492,8 @@ def validate_kpi_definition(
     kpi: dict[str, Any],
     available_fields: list[str] | tuple[str, ...] | set[str] | None = None,
     field_mappings: list[dict[str, Any]] | None = None,
+    saved_kpis: list[dict[str, Any]] | None = None,
+    kpi_by_id: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Validate one KPI definition without project or UI dependencies."""
     source = dict(kpi) if isinstance(kpi, dict) else {}
@@ -489,6 +503,9 @@ def validate_kpi_definition(
     kpi_name = str(source.get("kpi_name", "")).strip()
     aggregation = str(source.get("aggregation", "")).strip().lower()
     source_field = str(source.get("source_field", "")).strip()
+    kpi_id = str(source.get("kpi_id", "")).strip()
+    numerator_kpi_id = str(source.get("numerator_kpi_id") or "").strip()
+    denominator_kpi_id = str(source.get("denominator_kpi_id") or "").strip()
 
     invalid_messages: list[str] = []
     pending_messages: list[str] = []
@@ -503,7 +520,74 @@ def validate_kpi_definition(
             f"不支持的聚合方式：{aggregation or '空值'}。"
         )
 
-    source_required_aggregations = set(SUPPORTED_AGGREGATIONS) - {
+    if aggregation == "ratio" and lifecycle_status != "candidate":
+        if not numerator_kpi_id:
+            invalid_messages.append("比率 KPI 必须指定分子 KPI。")
+        if not denominator_kpi_id:
+            invalid_messages.append("比率 KPI 必须指定分母 KPI。")
+        if numerator_kpi_id and numerator_kpi_id == denominator_kpi_id:
+            invalid_messages.append("比率 KPI 的分子和分母不能引用同一个 KPI。")
+        if kpi_id and numerator_kpi_id == kpi_id:
+            invalid_messages.append("比率 KPI 不能将自身作为分子。")
+        if kpi_id and denominator_kpi_id == kpi_id:
+            invalid_messages.append("比率 KPI 不能将自身作为分母。")
+
+        dependency_by_id = _dependency_kpi_by_id(saved_kpis, kpi_by_id)
+        if dependency_by_id is not None:
+            for dependency_label, dependency_id in (
+                ("分子", numerator_kpi_id),
+                ("分母", denominator_kpi_id),
+            ):
+                if not dependency_id:
+                    continue
+                dependency = dependency_by_id.get(dependency_id)
+                if dependency is None:
+                    invalid_messages.append(
+                        f"比率 KPI 的{dependency_label}依赖不存在：{dependency_id}。"
+                    )
+                    continue
+                dependency_lifecycle = str(
+                    dependency.get("lifecycle_status", "saved")
+                ).strip().lower()
+                dependency_aggregation = str(
+                    dependency.get("aggregation", "")
+                ).strip().lower()
+                if dependency_lifecycle != "saved":
+                    invalid_messages.append(
+                        f"比率 KPI 的{dependency_label}依赖必须是已保存 KPI："
+                        f"{dependency_id}。"
+                    )
+                if dependency_aggregation == "ratio":
+                    invalid_messages.append(
+                        f"V1 暂不支持嵌套比率指标：{dependency_id}。"
+                    )
+                elif dependency_aggregation == RESERVED_AGGREGATION:
+                    invalid_messages.append(
+                        f"预留 KPI 不能作为比率{dependency_label}：{dependency_id}。"
+                    )
+                elif dependency_aggregation not in BASIC_KPI_AGGREGATIONS:
+                    invalid_messages.append(
+                        f"比率 KPI 的{dependency_label}聚合方式无效："
+                        f"{dependency_id}。"
+                    )
+                dependency_status = str(
+                    dependency.get("validation_status", "")
+                ).strip().lower()
+                current_dependency_status = validate_kpi_definition(
+                    dependency,
+                    available_fields=available_fields,
+                    field_mappings=field_mappings,
+                )["validation_status"]
+                if (
+                    dependency_status not in {"", "valid"}
+                    or current_dependency_status != "valid"
+                ):
+                    invalid_messages.append(
+                        f"比率 KPI 的{dependency_label}依赖未通过校验："
+                        f"{dependency_id}。"
+                    )
+
+    source_required_aggregations = set(BASIC_KPI_AGGREGATIONS) - {
         "count_rows"
     }
     if aggregation in source_required_aggregations and not source_field:
@@ -604,6 +688,12 @@ def calculate_basic_kpi(
             "status": "unsupported",
             "message": RESERVED_VALIDATION_MESSAGE,
         }
+    if aggregation == "ratio":
+        return {
+            **base_result,
+            "status": "unsupported",
+            "message": "比率 KPI 请使用统一比率执行函数计算。",
+        }
     if aggregation not in SUPPORTED_AGGREGATIONS:
         return {
             **base_result,
@@ -648,6 +738,132 @@ def calculate_basic_kpi(
         "status": "ok",
         "value": _json_safe_scalar(value),
         "message": "计算完成。",
+    }
+
+
+def calculate_ratio_kpi(
+    df: pd.DataFrame,
+    ratio_kpi: dict[str, Any],
+    kpi_by_id: dict[str, dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Calculate one non-nested ratio KPI from two existing basic KPIs."""
+    source = dict(ratio_kpi) if isinstance(ratio_kpi, dict) else {}
+    numerator_kpi_id = str(source.get("numerator_kpi_id") or "").strip()
+    denominator_kpi_id = str(source.get("denominator_kpi_id") or "").strip()
+    base_result = {
+        "status": "invalid_definition",
+        "value": None,
+        "aggregation": "ratio",
+        "numerator_kpi_id": numerator_kpi_id,
+        "denominator_kpi_id": denominator_kpi_id,
+        "numerator_value": None,
+        "denominator_value": None,
+        "message": "",
+    }
+    if str(source.get("aggregation", "")).strip().lower() != "ratio":
+        return {**base_result, "status": "unsupported", "message": "当前定义不是比率 KPI。"}
+    validation = validate_kpi_definition(source, kpi_by_id=kpi_by_id)
+    if validation["validation_status"] != "valid":
+        missing_ids = [
+            dependency_id
+            for dependency_id in (numerator_kpi_id, denominator_kpi_id)
+            if dependency_id and dependency_id not in (kpi_by_id or {})
+        ]
+        status = "missing_dependency" if missing_ids else "invalid_definition"
+        return {
+            **base_result,
+            "status": status,
+            "message": "；".join(validation["validation_messages"]),
+        }
+
+    numerator = (kpi_by_id or {}).get(numerator_kpi_id)
+    denominator = (kpi_by_id or {}).get(denominator_kpi_id)
+    if numerator is None or denominator is None:
+        return {
+            **base_result,
+            "status": "missing_dependency",
+            "message": "比率 KPI 缺少分子或分母依赖。",
+        }
+
+    numerator_result = calculate_basic_kpi(df, numerator)
+    if numerator_result.get("status") != "ok":
+        return {
+            **base_result,
+            "status": "dependency_error",
+            "message": f"分子 KPI 计算失败：{numerator_result.get('message', '')}",
+        }
+    numerator_value = numerator_result.get("value")
+    denominator_result = calculate_basic_kpi(df, denominator)
+    if denominator_result.get("status") != "ok":
+        return {
+            **base_result,
+            "status": "dependency_error",
+            "numerator_value": numerator_value,
+            "message": f"分母 KPI 计算失败：{denominator_result.get('message', '')}",
+        }
+    denominator_value = denominator_result.get("value")
+    values = {
+        "numerator_value": numerator_value,
+        "denominator_value": denominator_value,
+    }
+    if numerator_value is None or denominator_value is None:
+        return {
+            **base_result,
+            **values,
+            "status": "dependency_error",
+            "message": "分子或分母 KPI 当前没有可用于计算的数值。",
+        }
+    try:
+        numeric_numerator = float(numerator_value)
+        numeric_denominator = float(denominator_value)
+    except (TypeError, ValueError, OverflowError):
+        return {
+            **base_result,
+            **values,
+            "status": "dependency_error",
+            "message": "分子或分母 KPI 当前值无法执行比率计算。",
+        }
+    if not math.isfinite(numeric_numerator) or not math.isfinite(numeric_denominator):
+        return {
+            **base_result,
+            "numerator_value": (
+                numerator_value if math.isfinite(numeric_numerator) else None
+            ),
+            "denominator_value": (
+                denominator_value if math.isfinite(numeric_denominator) else None
+            ),
+            "status": "dependency_error",
+            "message": "分子或分母 KPI 当前值不是有限数值。",
+        }
+    try:
+        if numeric_denominator == 0:
+            return {
+                **base_result,
+                **values,
+                "status": "zero_denominator",
+                "message": "分母指标当前值为 0，无法计算比率。",
+            }
+        value = numeric_numerator / numeric_denominator
+    except (ArithmeticError, OverflowError):
+        return {
+            **base_result,
+            **values,
+            "status": "dependency_error",
+            "message": "分子或分母 KPI 当前值无法执行比率计算。",
+        }
+    if not math.isfinite(value):
+        return {
+            **base_result,
+            **values,
+            "status": "dependency_error",
+            "message": "比率计算结果不是有限数值。",
+        }
+    return {
+        **base_result,
+        **values,
+        "status": "ok",
+        "value": value,
+        "message": "比率计算完成。",
     }
 
 
@@ -845,6 +1061,25 @@ def _mapping_by_column(
         str(item.get("column_name")): dict(item)
         for item in field_mappings or []
         if isinstance(item, dict) and item.get("column_name")
+    }
+
+
+def _dependency_kpi_by_id(
+    saved_kpis: list[dict[str, Any]] | None,
+    kpi_by_id: dict[str, dict[str, Any]] | None,
+) -> dict[str, dict[str, Any]] | None:
+    if kpi_by_id is not None:
+        return {
+            str(kpi_id): dict(kpi)
+            for kpi_id, kpi in kpi_by_id.items()
+            if isinstance(kpi, dict)
+        }
+    if saved_kpis is None:
+        return None
+    return {
+        str(item.get("kpi_id", "")): dict(item)
+        for item in saved_kpis
+        if isinstance(item, dict) and item.get("kpi_id")
     }
 
 

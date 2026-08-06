@@ -13,14 +13,24 @@ from src.engines.kpi_engine import (
     normalize_kpi_definition,
 )
 from src.services.field_mapping_service import load_field_mappings
+from src.services.current_dataset_service import load_current_analysis_dataframe
 
 
 KPI_FILE = "kpi_definitions.json"
 
 
-def generate_project_kpi_candidates(project_id: str) -> list[dict[str, Any]]:
+def generate_project_kpi_candidates(
+    project_id: str,
+    dataframe: Any | None = None,
+) -> list[dict[str, Any]]:
     mappings = load_field_mappings(project_id)
-    return generate_kpi_candidates(mappings)
+    current_dataframe = dataframe
+    if current_dataframe is None:
+        try:
+            current_dataframe = load_current_analysis_dataframe(project_id)
+        except (FileNotFoundError, ValueError):
+            current_dataframe = None
+    return generate_kpi_candidates(mappings, dataframe=current_dataframe)
 
 
 def load_kpi_definitions(project_id: str) -> list[dict[str, Any]]:
@@ -33,27 +43,17 @@ def load_kpi_definitions(project_id: str) -> list[dict[str, Any]]:
             raise ValueError("KPI 配置损坏：config/kpi_definitions.json") from exc
         if not isinstance(content, list):
             raise ValueError("KPI 配置格式无效：应为 KPI 定义列表。")
-        return [
-            _normalize_with_timestamp(
-                item,
-                lifecycle_status="saved",
-                field_mappings=field_mappings,
-            )
-            for item in content
-            if isinstance(item, dict)
-        ]
+        return _normalize_kpi_collection(
+            content,
+            field_mappings=field_mappings,
+        )
     project = project_workspace.get_project(project_id)
     kpis = project.get("kpi_definitions", [])
     return (
-        [
-            _normalize_with_timestamp(
-                item,
-                lifecycle_status="saved",
-                field_mappings=field_mappings,
-            )
-            for item in kpis
-            if isinstance(item, dict)
-        ]
+        _normalize_kpi_collection(
+            kpis,
+            field_mappings=field_mappings,
+        )
         if isinstance(kpis, list)
         else []
     )
@@ -65,17 +65,11 @@ def save_kpi_definitions(
     available_fields: list[str] | tuple[str, ...] | set[str] | None = None,
 ) -> list[dict[str, Any]]:
     field_mappings = _load_validation_field_mappings(project_id)
-    normalized = [
-        _normalize_with_timestamp(
-            item,
-            lifecycle_status="saved",
-            available_fields=available_fields,
-            field_mappings=field_mappings,
-        )
-        for item in kpis or []
-        if isinstance(item, dict)
-        and str(item.get("kpi_name", "")).strip()
-    ]
+    normalized = _normalize_kpi_collection(
+        kpis,
+        available_fields=available_fields,
+        field_mappings=field_mappings,
+    )
     config_path = _kpi_path(project_id)
     config_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = config_path.with_suffix(".json.tmp")
@@ -103,14 +97,13 @@ def list_usable_kpis(
 ) -> list[dict[str, Any]]:
     """Return saved, enabled and currently valid KPIs in persisted order."""
     field_mappings = _load_validation_field_mappings(project_id)
+    current_kpis = _normalize_kpi_collection(
+        load_kpi_definitions(project_id),
+        available_fields=available_fields,
+        field_mappings=field_mappings,
+    )
     usable_kpis = []
-    for item in load_kpi_definitions(project_id):
-        normalized = _normalize_with_timestamp(
-            item,
-            lifecycle_status="saved",
-            available_fields=available_fields,
-            field_mappings=field_mappings,
-        )
+    for normalized in current_kpis:
         if (
             normalized["lifecycle_status"] == "saved"
             and normalized["enabled"]
@@ -120,11 +113,14 @@ def list_usable_kpis(
     return usable_kpis
 
 
-def list_unsaved_kpi_candidates(project_id: str) -> list[dict[str, Any]]:
+def list_unsaved_kpi_candidates(
+    project_id: str,
+    dataframe: Any | None = None,
+) -> list[dict[str, Any]]:
     """Return generated candidates that are not already persisted KPIs."""
     return filter_unsaved_kpi_candidates(
         load_kpi_definitions(project_id),
-        generate_project_kpi_candidates(project_id),
+        generate_project_kpi_candidates(project_id, dataframe=dataframe),
     )
 
 
@@ -172,6 +168,8 @@ def kpi_collection_signature(kpis: list[dict[str, Any]] | None) -> str:
             "kpi_name": str(item.get("kpi_name", "")),
             "aggregation": str(item.get("aggregation", "")),
             "source_field": str(item.get("source_field", "")),
+            "numerator_kpi_id": str(item.get("numerator_kpi_id", "")),
+            "denominator_kpi_id": str(item.get("denominator_kpi_id", "")),
             "field_type": str(item.get("field_type", "")),
             "category": str(item.get("category", "")),
             "description": str(item.get("description", "")),
@@ -383,15 +381,51 @@ def _normalize_with_timestamp(
     lifecycle_status: str = "saved",
     available_fields: list[str] | tuple[str, ...] | set[str] | None = None,
     field_mappings: list[dict[str, Any]] | None = None,
+    kpi_by_id: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     normalized = normalize_kpi_definition(
         kpi,
         lifecycle_status=lifecycle_status,
         available_fields=available_fields,
         field_mappings=field_mappings,
+        kpi_by_id=kpi_by_id,
     )
     normalized["updated_at"] = normalized["updated_at"] or _utc_now()
     return normalized
+
+
+def _normalize_kpi_collection(
+    kpis: list[dict[str, Any]] | None,
+    *,
+    available_fields: list[str] | tuple[str, ...] | set[str] | None = None,
+    field_mappings: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    first_pass = [
+        _normalize_with_timestamp(
+            item,
+            lifecycle_status="saved",
+            available_fields=available_fields,
+            field_mappings=field_mappings,
+        )
+        for item in kpis or []
+        if isinstance(item, dict)
+        and str(item.get("kpi_name", "")).strip()
+    ]
+    kpi_by_id = {
+        item["kpi_id"]: item
+        for item in first_pass
+        if item.get("kpi_id")
+    }
+    return [
+        _normalize_with_timestamp(
+            item,
+            lifecycle_status="saved",
+            available_fields=available_fields,
+            field_mappings=field_mappings,
+            kpi_by_id=kpi_by_id,
+        )
+        for item in first_pass
+    ]
 
 
 def _prepare_saved_kpi(
@@ -418,12 +452,14 @@ def _prepare_saved_kpi(
     return normalized
 
 
-def _kpi_identity(kpi: dict[str, Any]) -> tuple[str, str, str, str]:
+def _kpi_identity(kpi: dict[str, Any]) -> tuple[str, str, str, str, str, str]:
     return (
         str(kpi.get("kpi_name", "")).strip().casefold(),
         str(kpi.get("aggregation", "")).strip().lower(),
         str(kpi.get("source_field", "")).strip(),
         str(kpi.get("category", "")).strip(),
+        str(kpi.get("numerator_kpi_id", "")).strip(),
+        str(kpi.get("denominator_kpi_id", "")).strip(),
     )
 
 
