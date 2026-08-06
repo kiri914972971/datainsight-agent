@@ -1,11 +1,40 @@
 from __future__ import annotations
 
+import math
 import uuid
 from typing import Any
 
+import pandas as pd
 
-SUPPORTED_AGGREGATIONS = ("sum", "count", "avg", "max", "min")
+from src.exploration import is_derived_time_column
+
+
+SUPPORTED_AGGREGATIONS = (
+    "sum",
+    "count",
+    "count_rows",
+    "count_distinct",
+    "avg",
+    "max",
+    "min",
+)
 RESERVED_AGGREGATION = "reserved"
+AGGREGATION_LABELS = {
+    "sum": "求和",
+    "count": "非空计数",
+    "count_rows": "记录行数",
+    "count_distinct": "去重计数",
+    "avg": "平均值",
+    "max": "最大值",
+    "min": "最小值",
+    "reserved": "预留能力",
+}
+AGGREGATION_HELP_TEXTS = {
+    "count": "非空计数统计来源字段中的非空记录，不进行去重。",
+    "count_rows": "记录行数统计当前分析数据集的总行数，不等同于订单数；该规则无需来源字段。",
+    "count_distinct": "去重计数统计来源字段中的非空唯一值数量，适合订单 ID、客户 ID、人员编号等字段。",
+}
+NO_SOURCE_FIELD_LABEL = "无需来源字段"
 KPI_CATEGORIES = ("核心指标", "时间指标", "维度指标")
 KPI_LIFECYCLE_STATUSES = ("candidate", "saved")
 KPI_VALIDATION_STATUSES = ("valid", "invalid", "pending")
@@ -33,11 +62,128 @@ _FIELD_TYPE_ALIASES = {
     "人员字段": "person",
     "categorical": "categorical",
     "类别字段": "categorical",
+    "row": "row",
+    "dataset": "dataset",
 }
+
+
+def get_kpi_source_field_type(
+    aggregation: str,
+    source_field: str,
+    field_mappings: list[dict[str, Any]] | None,
+    field_roles: dict[str, Any] | None = None,
+) -> str:
+    """Return the single valid UI field type for a KPI source selection."""
+    if aggregation == "count_rows":
+        return "row"
+
+    source_field = str(source_field or "")
+    mapping = _mapping_by_column(field_mappings).get(source_field, {})
+    mapped_type = str(
+        mapping.get("confirmed_type") or mapping.get("inferred_type") or ""
+    ).strip()
+    normalized_mapping_type = _FIELD_TYPE_ALIASES.get(mapped_type, "")
+    role = _field_role_by_column(field_roles).get(source_field)
+
+    if role == "derived_time":
+        return "custom"
+    if role == "datetime":
+        return "date"
+    if role == "identifier":
+        return "id"
+    if role == "numeric":
+        return (
+            normalized_mapping_type
+            if normalized_mapping_type in {"amount", "numeric"}
+            else "numeric"
+        )
+    if role in {"categorical", "boolean"}:
+        return (
+            normalized_mapping_type
+            if normalized_mapping_type
+            in {"region", "product", "person", "categorical"}
+            else "categorical"
+        )
+    if role in {"constant", "unsupported"}:
+        return "custom"
+    return normalized_mapping_type or "custom"
+
+
+def get_kpi_source_field_options(
+    aggregation: str,
+    available_fields: list[str] | tuple[str, ...],
+    field_mappings: list[dict[str, Any]] | None,
+    field_roles: dict[str, Any] | None = None,
+    no_source_field_label: str = NO_SOURCE_FIELD_LABEL,
+) -> list[str]:
+    """Return source fields allowed by the selected KPI aggregation."""
+    fields = list(dict.fromkeys(str(field) for field in available_fields))
+    if aggregation == "count_rows":
+        return [no_source_field_label]
+    if aggregation in {"count", "count_distinct"}:
+        return fields
+
+    role_by_column = _field_role_by_column(field_roles)
+    options = []
+    for field in fields:
+        role = role_by_column.get(field)
+        field_type = get_kpi_source_field_type(
+            aggregation,
+            field,
+            field_mappings,
+            field_roles,
+        )
+        if aggregation in {"sum", "avg"}:
+            allowed = role == "numeric" and field_type in {"amount", "numeric"}
+        elif aggregation in {"max", "min"}:
+            allowed = (
+                role in {"numeric", "datetime"}
+                and field_type in {"amount", "numeric", "date"}
+            )
+        else:
+            allowed = False
+        if allowed:
+            options.append(field)
+    return options
+
+
+def resolve_kpi_source_selection(
+    aggregation: str,
+    current_source_field: str | None,
+    available_fields: list[str] | tuple[str, ...],
+    field_mappings: list[dict[str, Any]] | None,
+    field_roles: dict[str, Any] | None = None,
+    no_source_field_label: str = NO_SOURCE_FIELD_LABEL,
+) -> dict[str, Any]:
+    """Resolve a valid source option and its non-editable field type for the UI."""
+    options = get_kpi_source_field_options(
+        aggregation,
+        available_fields,
+        field_mappings,
+        field_roles,
+        no_source_field_label,
+    )
+    selected_option = str(current_source_field or "")
+    if selected_option not in options:
+        selected_option = options[0] if options else ""
+    source_field = "" if aggregation == "count_rows" else selected_option
+    return {
+        "options": options,
+        "selected_option": selected_option,
+        "source_field": source_field,
+        "field_type": get_kpi_source_field_type(
+            aggregation,
+            source_field,
+            field_mappings,
+            field_roles,
+        ),
+        "has_compatible_fields": bool(options),
+    }
 
 
 def generate_kpi_candidates(
     field_mappings: list[dict[str, Any]] | None,
+    dataframe: pd.DataFrame | None = None,
 ) -> list[dict[str, Any]]:
     """Generate project-level KPI definition candidates from confirmed field mappings."""
     mappings = [
@@ -47,12 +193,29 @@ def generate_kpi_candidates(
     ]
     amount_fields = _columns_by_type(mappings, "金额字段")
     id_fields = _columns_by_type(mappings, "ID字段")
-    date_fields = _columns_by_type(mappings, "日期字段")
+    date_fields = [
+        field
+        for field in _columns_by_type(mappings, "日期字段")
+        if not _is_derived_time_mapping(field, dataframe)
+    ]
     person_fields = _columns_by_type(mappings, "人员字段")
     product_fields = _columns_by_type(mappings, "产品字段")
     region_fields = _columns_by_type(mappings, "区域字段")
 
-    candidates: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = [
+        _kpi(
+            kpi_name="记录数",
+            aggregation="count_rows",
+            source_field="",
+            field_type="row",
+            category="核心指标",
+            description=(
+                "统计当前分析数据集的记录行数。记录数不等同于订单数，"
+                "数据合并可能导致记录重复展开。"
+            ),
+            enabled=False,
+        )
+    ]
     for index, field in enumerate(amount_fields):
         candidates.append(
             _kpi(
@@ -81,11 +244,11 @@ def generate_kpi_candidates(
         candidates.append(
             _kpi(
                 kpi_name=_count_kpi_name(field),
-                aggregation="count",
+                aggregation="count_distinct",
                 source_field=field,
                 field_type="id",
                 category="核心指标",
-                description=f"统计 {field} 的记录数量",
+                description=f"统计 {field} 中非空唯一值的数量",
                 enabled=False,
             )
         )
@@ -225,9 +388,12 @@ def validate_kpi_definition(
             f"不支持的聚合方式：{aggregation or '空值'}。"
         )
 
-    if aggregation in SUPPORTED_AGGREGATIONS and not source_field:
+    source_required_aggregations = set(SUPPORTED_AGGREGATIONS) - {
+        "count_rows"
+    }
+    if aggregation in source_required_aggregations and not source_field:
         invalid_messages.append("来源字段不能为空。")
-    elif aggregation in SUPPORTED_AGGREGATIONS:
+    elif aggregation in source_required_aggregations:
         if available_fields is not None:
             available_field_names = {
                 str(field) for field in available_fields
@@ -264,6 +430,27 @@ def validate_kpi_definition(
                 f"聚合方式 {aggregation} 不适用于字段类型 "
                 f"{resolved_field_type or 'unknown'}。"
             )
+        elif aggregation == "count_distinct" and resolved_field_type not in {
+            "id",
+            "date",
+            "categorical",
+            "person",
+            "product",
+            "region",
+            "custom",
+            "numeric",
+            "amount",
+        }:
+            invalid_messages.append(
+                "聚合方式 count_distinct 不适用于字段类型 "
+                f"{resolved_field_type or 'unknown'}。"
+            )
+    elif aggregation == "count_rows":
+        resolved_field_type = _resolved_field_type(source, None)
+        if resolved_field_type not in {"row", "dataset", "custom"}:
+            invalid_messages.append(
+                "聚合方式 count_rows 仅适用于 row、dataset 或 custom 字段类型。"
+            )
 
     validation_messages = _deduplicate_messages(
         invalid_messages + pending_messages
@@ -278,6 +465,90 @@ def validate_kpi_definition(
         "validation_status": validation_status,
         "validation_messages": validation_messages,
     }
+
+
+def calculate_basic_kpi(
+    df: pd.DataFrame,
+    kpi_definition: dict[str, Any],
+) -> dict[str, Any]:
+    """Execute one basic KPI definition without mutating the DataFrame."""
+    aggregation = str(kpi_definition.get("aggregation", "")).strip().lower()
+    source_field = str(kpi_definition.get("source_field", "")).strip()
+    base_result = {
+        "status": "invalid_definition",
+        "value": None,
+        "aggregation": aggregation,
+        "source_field": source_field,
+        "record_count": int(len(df)),
+        "message": "",
+    }
+
+    if aggregation == RESERVED_AGGREGATION:
+        return {
+            **base_result,
+            "status": "unsupported",
+            "message": RESERVED_VALIDATION_MESSAGE,
+        }
+    if aggregation not in SUPPORTED_AGGREGATIONS:
+        return {
+            **base_result,
+            "message": f"不支持的聚合方式：{aggregation or '空值'}。",
+        }
+    if aggregation == "count_rows":
+        return {
+            **base_result,
+            "status": "ok",
+            "value": int(len(df)),
+            "source_field": "",
+            "message": "统计当前筛选数据集的记录行数。",
+        }
+    if not source_field:
+        return {**base_result, "message": "来源字段不能为空。"}
+    if source_field not in df.columns:
+        return {
+            **base_result,
+            "status": "missing_field",
+            "message": f"来源字段不存在：{source_field}。",
+        }
+
+    series = df[source_field]
+    try:
+        if aggregation == "count":
+            value = int(series.notna().sum())
+        elif aggregation == "count_distinct":
+            value = int(series.dropna().nunique())
+        elif aggregation in {"sum", "avg"}:
+            numeric = pd.to_numeric(series, errors="coerce")
+            value = numeric.sum() if aggregation == "sum" else numeric.mean()
+        else:
+            valid = series.dropna()
+            value = valid.max() if aggregation == "max" else valid.min()
+    except (TypeError, ValueError) as exc:
+        return {
+            **base_result,
+            "message": f"当前字段无法执行 {aggregation}：{exc}",
+        }
+    return {
+        **base_result,
+        "status": "ok",
+        "value": _json_safe_scalar(value),
+        "message": "计算完成。",
+    }
+
+
+def missing_entity_id_candidate_names(
+    candidates: list[dict[str, Any]] | None,
+) -> list[str]:
+    """Return missing order/customer distinct-count candidate names."""
+    candidate_names = {
+        str(item.get("kpi_name", ""))
+        for item in candidates or []
+        if isinstance(item, dict)
+        and item.get("aggregation") == "count_distinct"
+    }
+    return [
+        name for name in ("订单数", "客户数") if name not in candidate_names
+    ]
 
 
 def _dimension_kpi(field: str, name: str, field_type: str) -> dict[str, Any]:
@@ -343,7 +614,20 @@ def _count_kpi_name(field: str) -> str:
         return "订单数"
     if any(keyword in lowered for keyword in ("客户", "用户", "customer", "user")):
         return "客户数"
-    return f"{field}数量"
+    if any(
+        keyword in lowered
+        for keyword in (
+            "销售",
+            "员工",
+            "人员",
+            "staff",
+            "employee",
+            "salesperson",
+            "sales_id",
+        )
+    ):
+        return "销售人员数"
+    return f"{field}去重数量"
 
 
 def _columns_by_type(mappings: list[dict[str, Any]], field_type: str) -> list[str]:
@@ -352,6 +636,17 @@ def _columns_by_type(mappings: list[dict[str, Any]], field_type: str) -> list[st
         for item in mappings
         if item.get("confirmed_type") == field_type
     ]
+
+
+def _is_derived_time_mapping(
+    column_name: str,
+    dataframe: pd.DataFrame | None,
+) -> bool:
+    return bool(
+        dataframe is not None
+        and column_name in dataframe.columns
+        and is_derived_time_column(column_name, dataframe[column_name])
+    )
 
 
 def _deduplicate_kpis(kpis: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -365,6 +660,21 @@ def _mapping_by_column(
         str(item.get("column_name")): dict(item)
         for item in field_mappings or []
         if isinstance(item, dict) and item.get("column_name")
+    }
+
+
+def _field_role_by_column(
+    field_roles: dict[str, Any] | None,
+) -> dict[str, str]:
+    if not isinstance(field_roles, dict):
+        return {}
+    role_by_column = field_roles.get("role_by_column", field_roles)
+    if not isinstance(role_by_column, dict):
+        return {}
+    return {
+        str(column): str(role)
+        for column, role in role_by_column.items()
+        if column is not None and role is not None
     }
 
 
@@ -386,6 +696,18 @@ def _resolved_field_type(
 
 def _deduplicate_messages(messages: list[str]) -> list[str]:
     return list(dict.fromkeys(str(message) for message in messages if message))
+
+
+def _json_safe_scalar(value: Any) -> Any:
+    if value is None or value is pd.NA:
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if hasattr(value, "item"):
+        value = value.item()
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    return value
 
 
 def _kpi_key(kpi: dict[str, Any]) -> tuple[str, str, str, str]:

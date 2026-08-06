@@ -42,7 +42,17 @@ import importlib
 
 from src import exporter as exporter_module
 from src.engines.field_mapping_engine import FIELD_TYPES
-from src.engines.kpi_engine import KPI_CATEGORIES, RESERVED_AGGREGATION, SUPPORTED_AGGREGATIONS
+from src.engines.kpi_engine import (
+    AGGREGATION_HELP_TEXTS,
+    AGGREGATION_LABELS,
+    KPI_CATEGORIES,
+    NO_SOURCE_FIELD_LABEL,
+    RESERVED_AGGREGATION,
+    SUPPORTED_AGGREGATIONS,
+    get_kpi_source_field_type,
+    resolve_kpi_source_selection,
+    missing_entity_id_candidate_names,
+)
 from src.engines.metric_dictionary_engine import METRIC_CATEGORIES
 from src.engines.analysis_engine import execute_analysis
 from src.engines.business_analysis_engine import generate_business_analysis as generate_rule_business_analysis
@@ -228,9 +238,10 @@ from src.services.field_mapping_service import (
 from src.services.kpi_service import (
     add_saved_kpi_definition,
     delete_kpi_definition,
+    filter_unsaved_kpi_candidates,
+    generate_project_kpi_candidates,
     kpi_collection_signature,
     load_kpi_definitions,
-    list_unsaved_kpi_candidates,
     list_usable_kpis,
     save_edited_kpi_definitions,
     save_selected_kpi_candidates,
@@ -3666,9 +3677,29 @@ def render_kpi_center_tab(
             "指标中心用于管理项目中的业务指标定义。后续需要正式指标的功能，应使用已保存、已启用且校验通过的指标。"
         )
 
+    available_fields = [str(column) for column in dataframe.columns]
+    field_mappings = []
+    kpi_field_roles = build_exploration_field_roles(dataframe)
     try:
+        field_mappings = load_field_mappings(project_id)
+        confirmed_type_by_column = {
+            str(item.get("column_name")): item.get("confirmed_type")
+            for item in field_mappings
+            if item.get("column_name") in dataframe.columns
+        }
+        kpi_field_roles = build_exploration_field_roles(
+            dataframe,
+            confirmed_type_by_column=confirmed_type_by_column,
+        )
         saved_kpis = load_kpi_definitions(project_id)
-        candidate_kpis = list_unsaved_kpi_candidates(project_id)
+        generated_kpis = generate_project_kpi_candidates(
+            project_id,
+            dataframe=dataframe,
+        )
+        candidate_kpis = filter_unsaved_kpi_candidates(
+            saved_kpis,
+            generated_kpis,
+        )
         usable_kpis = list_usable_kpis(
             project_id,
             available_fields=[str(column) for column in dataframe.columns],
@@ -3676,6 +3707,7 @@ def render_kpi_center_tab(
     except ValueError as exc:
         st.error(str(exc))
         saved_kpis = []
+        generated_kpis = []
         candidate_kpis = []
         usable_kpis = []
 
@@ -3698,7 +3730,24 @@ def render_kpi_center_tab(
     st.caption(
         "系统根据字段映射推荐可能的指标。候选指标尚未保存，也不会进入业务分析或报告。请确认计算规则后选择保存。"
     )
-    source_field_options = ["项目级预留"] + [str(column) for column in dataframe.columns]
+    if missing_entity_id_candidate_names(generated_kpis):
+        st.caption(
+            "当前字段映射中未识别到订单 ID 或客户 ID，因此未生成订单数或客户数的去重计数候选。数量字段与 ID 字段口径不同，例如‘成交客户数’通常应按业务定义求和，而不是去重计数。"
+        )
+    no_source_field_label = NO_SOURCE_FIELD_LABEL
+    source_field_options = [no_source_field_label] + [
+        str(column) for column in dataframe.columns
+    ]
+    aggregation_options = [
+        AGGREGATION_LABELS[value]
+        for value in (*SUPPORTED_AGGREGATIONS, RESERVED_AGGREGATION)
+    ]
+    aggregation_by_label = {
+        label: value for value, label in AGGREGATION_LABELS.items()
+    }
+    st.caption(
+        "聚合方式：非空计数统计非空记录且不去重；记录行数统计数据集总行数；去重计数统计非空唯一值。"
+    )
     candidate_signature = kpi_collection_signature(candidate_kpis)
     candidate_by_id = {
         str(item.get("kpi_id", "")): item for item in candidate_kpis
@@ -3711,8 +3760,10 @@ def render_kpi_center_tab(
                     "选择": False,
                     "指标名称": item["kpi_name"],
                     "分类": item["category"],
-                    "聚合方式": item["aggregation"],
-                    "来源字段": item["source_field"] or "项目级预留",
+                    "聚合方式": AGGREGATION_LABELS.get(
+                        item["aggregation"], item["aggregation"]
+                    ),
+                    "来源字段": item["source_field"] or no_source_field_label,
                     "字段类型": item["field_type"],
                     "推荐说明": item["description"],
                     "当前状态": "待确认",
@@ -3743,8 +3794,7 @@ def render_kpi_center_tab(
                 ),
                 "聚合方式": st.column_config.SelectboxColumn(
                     "聚合方式",
-                    options=list(SUPPORTED_AGGREGATIONS)
-                    + [RESERVED_AGGREGATION],
+                    options=aggregation_options,
                 ),
                 "来源字段": st.column_config.SelectboxColumn(
                     "来源字段", options=source_field_options
@@ -3759,6 +3809,8 @@ def render_kpi_center_tab(
                         "region",
                         "product",
                         "person",
+                        "row",
+                        "dataset",
                         "custom",
                     ],
                 ),
@@ -3775,19 +3827,29 @@ def render_kpi_center_tab(
                 if not row.get("选择"):
                     continue
                 original_item = candidate_by_id.get(str(row.get("_kpi_id", "")), {})
+                aggregation = aggregation_by_label.get(
+                    row.get("聚合方式", ""), row.get("聚合方式", "")
+                )
+                source_field = (
+                    ""
+                    if aggregation == "count_rows"
+                    or row.get("来源字段") == no_source_field_label
+                    else row.get("来源字段", "")
+                )
+                field_type = (
+                    "row"
+                    if aggregation == "count_rows"
+                    else row.get("字段类型", "custom")
+                )
                 selected_candidates.append(
                     {
                         **original_item,
                         "kpi_id": row.get("_kpi_id") or original_item.get("kpi_id"),
                         "kpi_name": row.get("指标名称", ""),
                         "category": row.get("分类", "核心指标"),
-                        "aggregation": row.get("聚合方式", ""),
-                        "source_field": (
-                            ""
-                            if row.get("来源字段") == "项目级预留"
-                            else row.get("来源字段", "")
-                        ),
-                        "field_type": row.get("字段类型", "custom"),
+                        "aggregation": aggregation,
+                        "source_field": source_field,
+                        "field_type": field_type,
                         "description": row.get("推荐说明", ""),
                         "created_by": "auto",
                         "lifecycle_status": "candidate",
@@ -3844,8 +3906,10 @@ def render_kpi_center_tab(
                     "_kpi_id": item["kpi_id"],
                     "指标名称": item["kpi_name"],
                     "分类": item["category"],
-                    "聚合方式": item["aggregation"],
-                    "来源字段": item["source_field"] or "项目级预留",
+                    "聚合方式": AGGREGATION_LABELS.get(
+                        item["aggregation"], item["aggregation"]
+                    ),
+                    "来源字段": item["source_field"] or no_source_field_label,
                     "字段类型": item["field_type"],
                     "描述": item["description"],
                     "启用状态": bool(item["enabled"]),
@@ -3887,8 +3951,7 @@ def render_kpi_center_tab(
                 ),
                 "聚合方式": st.column_config.SelectboxColumn(
                     "聚合方式",
-                    options=list(SUPPORTED_AGGREGATIONS)
-                    + [RESERVED_AGGREGATION],
+                    options=aggregation_options,
                 ),
                 "来源字段": st.column_config.SelectboxColumn(
                     "来源字段", options=source_field_options
@@ -3903,6 +3966,8 @@ def render_kpi_center_tab(
                         "region",
                         "product",
                         "person",
+                        "row",
+                        "dataset",
                         "custom",
                     ],
                 ),
@@ -3917,19 +3982,29 @@ def render_kpi_center_tab(
             definitions = []
             for row in edited_saved.to_dict("records"):
                 original_item = saved_by_id.get(str(row.get("_kpi_id", "")), {})
+                aggregation = aggregation_by_label.get(
+                    row.get("聚合方式", ""), row.get("聚合方式", "")
+                )
+                source_field = (
+                    ""
+                    if aggregation == "count_rows"
+                    or row.get("来源字段") == no_source_field_label
+                    else row.get("来源字段", "")
+                )
+                field_type = (
+                    "row"
+                    if aggregation == "count_rows"
+                    else row.get("字段类型", "custom")
+                )
                 definitions.append(
                     {
                         **original_item,
                         "kpi_id": row.get("_kpi_id") or original_item.get("kpi_id"),
                         "kpi_name": row.get("指标名称", ""),
                         "category": row.get("分类", "核心指标"),
-                        "aggregation": row.get("聚合方式", ""),
-                        "source_field": (
-                            ""
-                            if row.get("来源字段") == "项目级预留"
-                            else row.get("来源字段", "")
-                        ),
-                        "field_type": row.get("字段类型", "custom"),
+                        "aggregation": aggregation,
+                        "source_field": source_field,
+                        "field_type": field_type,
                         "description": row.get("描述", ""),
                         "enabled": bool(row.get("启用状态", False)),
                         "lifecycle_status": "saved",
@@ -3950,23 +4025,76 @@ def render_kpi_center_tab(
                 )
             st.session_state[notice_key] = notices
             st.rerun()
+        if any(item.get("aggregation") == "count" for item in saved_kpis):
+            st.caption(
+                "已保存规则中存在非空计数指标。如需统计唯一订单、客户或人员，请将聚合方式改为去重计数。"
+            )
     else:
         st.info("当前尚未保存正式指标。请从自动推荐候选中选择保存，或新增自定义指标。")
 
     st.subheader("新增指标计算规则")
-    st.caption("V1 支持 SUM、COUNT、AVG、MAX、MIN。客单价等复杂公式会在后续公式引擎中支持。")
+    st.caption(
+        "支持求和、非空计数、记录行数、去重计数、平均值、最大值和最小值。客单价等复杂公式将在后续任务处理。"
+    )
+    new_aggregation = st.selectbox(
+        "聚合方式",
+        list(SUPPORTED_AGGREGATIONS),
+        format_func=lambda value: AGGREGATION_LABELS[value],
+        key=f"add_kpi_aggregation_{project_id}",
+    )
+    aggregation_help = AGGREGATION_HELP_TEXTS.get(new_aggregation)
+    if aggregation_help:
+        st.caption(aggregation_help)
+    source_state_key = f"add_kpi_source_field_{project_id}"
+    source_selection = resolve_kpi_source_selection(
+        new_aggregation,
+        st.session_state.get(source_state_key),
+        available_fields,
+        field_mappings,
+        kpi_field_roles,
+    )
+    selected_source_options = source_selection["options"]
+    has_compatible_fields = source_selection["has_compatible_fields"]
+    if has_compatible_fields:
+        if st.session_state.get(source_state_key) != source_selection["selected_option"]:
+            st.session_state[source_state_key] = source_selection["selected_option"]
+        source_columns = st.columns(2)
+        new_source_field = source_columns[0].selectbox(
+            "来源字段",
+            selected_source_options,
+            disabled=new_aggregation == "count_rows",
+            key=source_state_key,
+        )
+        new_field_type = get_kpi_source_field_type(
+            new_aggregation,
+            "" if new_aggregation == "count_rows" else new_source_field,
+            field_mappings,
+            kpi_field_roles,
+        )
+        source_columns[1].selectbox(
+            "字段类型",
+            [new_field_type],
+            disabled=True,
+            key=(
+                f"add_kpi_field_type_{project_id}_{new_aggregation}_"
+                f"{new_source_field}_{new_field_type}"
+            ),
+        )
+    else:
+        new_source_field = ""
+        new_field_type = "custom"
+        st.info("当前分析数据集中没有适用于该聚合方式的字段。")
+
     with st.form(f"add_kpi_form_{project_id}"):
-        add_columns = st.columns(5)
+        add_columns = st.columns(2)
         new_name = add_columns[0].text_input("指标名称", placeholder="例如：客单价")
         new_category = add_columns[1].selectbox("分类", list(KPI_CATEGORIES))
-        new_aggregation = add_columns[2].selectbox("聚合方式", list(SUPPORTED_AGGREGATIONS))
-        new_source_field = add_columns[3].selectbox("来源字段", [str(column) for column in dataframe.columns])
-        new_field_type = add_columns[4].selectbox(
-            "字段类型",
-            ["amount", "numeric", "id", "date", "region", "product", "person", "custom"],
-        )
         new_description = st.text_input("描述", placeholder="说明这个 KPI 的业务含义")
-        submitted = st.form_submit_button("新增指标计算规则", type="primary")
+        submitted = st.form_submit_button(
+            "新增指标计算规则",
+            type="primary",
+            disabled=not has_compatible_fields,
+        )
         if submitted:
             if not new_name.strip():
                 st.error("指标名称不能为空。")
@@ -3978,7 +4106,11 @@ def render_kpi_center_tab(
                             "kpi_name": new_name,
                             "category": new_category,
                             "aggregation": new_aggregation,
-                            "source_field": new_source_field,
+                            "source_field": (
+                                ""
+                                if new_aggregation == "count_rows"
+                                else new_source_field
+                            ),
                             "field_type": new_field_type,
                             "description": new_description,
                             "created_by": "user",
@@ -4003,7 +4135,7 @@ def render_kpi_center_tab(
 
     st.subheader("删除指标计算规则")
     if saved_kpis:
-        delete_options = {item["kpi_id"]: f"{item['kpi_name']} · {item['source_field'] or '项目级预留'}" for item in saved_kpis}
+        delete_options = {item["kpi_id"]: f"{item['kpi_name']} · {item['source_field'] or '无需来源字段'}" for item in saved_kpis}
         delete_kpi_id = st.selectbox(
             "选择要删除的指标计算规则",
             list(delete_options),

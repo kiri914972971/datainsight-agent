@@ -30,7 +30,8 @@ def test_kpi_summary_has_five_unambiguous_cards():
 
 
 def test_candidate_and_saved_sections_use_independent_sources():
-    assert "list_unsaved_kpi_candidates(project_id)" in KPI_TAB_SOURCE
+    assert "generate_project_kpi_candidates(" in KPI_TAB_SOURCE
+    assert "filter_unsaved_kpi_candidates(" in KPI_TAB_SOURCE
     assert "saved_kpis = load_kpi_definitions(project_id)" in KPI_TAB_SOURCE
     assert "merged_project_kpis" not in KPI_TAB_SOURCE
 
@@ -89,3 +90,67 @@ def test_metric_center_copy_does_not_claim_dashboard_integration_is_complete():
 def test_delete_warning_points_to_metric_dictionary_without_cascade_delete():
     assert "该指标可能存在关联的指标语义定义" in KPI_TAB_SOURCE
     assert "delete_metric_definition" not in KPI_TAB_SOURCE
+
+
+def test_new_count_aggregations_are_available_with_chinese_labels():
+    assert "AGGREGATION_LABELS" in KPI_TAB_SOURCE
+    assert "SUPPORTED_AGGREGATIONS" in KPI_TAB_SOURCE
+    assert "非空计数" in KPI_TAB_SOURCE
+    assert "记录行数" in KPI_TAB_SOURCE
+    assert "去重计数" in KPI_TAB_SOURCE
+
+
+def test_count_rows_submission_clears_source_and_uses_row_type():
+    assert 'new_aggregation == "count_rows"' in KPI_TAB_SOURCE
+    assert '"" if new_aggregation == "count_rows"' in KPI_TAB_SOURCE
+    assert '"field_type": new_field_type' in KPI_TAB_SOURCE
+    assert "NO_SOURCE_FIELD_LABEL" in KPI_TAB_SOURCE
+
+
+def test_new_form_uses_one_source_options_helper_instead_of_manual_lists():
+    assert "resolve_kpi_source_selection(" in KPI_TAB_SOURCE
+    assert "kpi_field_roles" in KPI_TAB_SOURCE
+    assert "new_source_field_options" not in KPI_TAB_SOURCE
+    assert "selected_field_type_options" not in KPI_TAB_SOURCE
+
+
+def test_source_and_field_type_controls_rerun_before_form_submission():
+    source_control = KPI_TAB_SOURCE.index('new_source_field = source_columns[0].selectbox(')
+    field_type_control = KPI_TAB_SOURCE.index('source_columns[1].selectbox(')
+    form_start = KPI_TAB_SOURCE.index('with st.form(f"add_kpi_form_')
+
+    assert source_control < form_start
+    assert field_type_control < form_start
+    assert "get_kpi_source_field_type(" in KPI_TAB_SOURCE
+    assert '"字段类型",\n            [new_field_type],\n            disabled=True' in KPI_TAB_SOURCE
+
+
+def test_new_form_state_is_project_scoped_and_invalid_source_is_reset():
+    assert 'source_state_key = f"add_kpi_source_field_{project_id}"' in KPI_TAB_SOURCE
+    assert 'key=f"add_kpi_aggregation_{project_id}"' in KPI_TAB_SOURCE
+    assert 'st.session_state.get(source_state_key)' in KPI_TAB_SOURCE
+    assert 'st.session_state[source_state_key] = source_selection["selected_option"]' in KPI_TAB_SOURCE
+
+
+def test_no_compatible_source_disables_add_button():
+    assert "当前分析数据集中没有适用于该聚合方式的字段。" in KPI_TAB_SOURCE
+    assert "disabled=not has_compatible_fields" in KPI_TAB_SOURCE
+
+
+def test_count_explanation_is_selected_outside_form_for_dynamic_rerun():
+    aggregation_control = KPI_TAB_SOURCE.index('new_aggregation = st.selectbox(')
+    form_start = KPI_TAB_SOURCE.index('with st.form(f"add_kpi_form_')
+    assert aggregation_control < form_start
+    assert "AGGREGATION_HELP_TEXTS.get(new_aggregation)" in KPI_TAB_SOURCE
+    assert "if aggregation_help:" in KPI_TAB_SOURCE
+
+
+def test_missing_id_candidate_guidance_uses_complete_generated_candidates():
+    assert "missing_entity_id_candidate_names(generated_kpis)" in KPI_TAB_SOURCE
+    assert "当前字段映射中未识别到订单 ID 或客户 ID" in KPI_TAB_SOURCE
+    assert "‘成交客户数’通常应按业务定义求和，而不是去重计数" in KPI_TAB_SOURCE
+
+
+def test_legacy_count_has_non_migration_guidance():
+    assert "已保存规则中存在非空计数指标" in KPI_TAB_SOURCE
+    assert "请将聚合方式改为去重计数" in KPI_TAB_SOURCE
