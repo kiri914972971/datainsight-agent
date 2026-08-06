@@ -133,6 +133,33 @@ _TIME_COMPONENT_NAME_KEYWORDS_EN = {
     "date",
 }
 
+_UNIT_PRICE_NAMES_ZH = (
+    "客单价",
+    "单价",
+    "均价",
+    "平均订单金额",
+)
+_UNIT_PRICE_NAMES_EN = {
+    "aov",
+    "average order value",
+    "unit price",
+    "average price",
+}
+_AOV_NUMERATOR_NAMES = {
+    "销售额",
+    "成交金额",
+    "营业收入",
+    "revenue",
+    "sales",
+}
+_AOV_DENOMINATOR_NAMES = {
+    "成交客户数",
+    "客户数",
+    "成交人数",
+    "customer count",
+    "customers",
+}
+
 
 def is_additive_quantity_field(column_name: str) -> bool:
     """Return whether a field name clearly describes an additive quantity."""
@@ -162,6 +189,152 @@ def is_additive_quantity_field(column_name: str) -> bool:
     if tokens and tokens.issubset(_TIME_COMPONENT_NAME_KEYWORDS_EN):
         return False
     return True
+
+
+def is_unit_price_field(column_name: str) -> bool:
+    """Return whether a field name explicitly describes a unit-price metric."""
+    normalized = _normalize_semantic_name(column_name)
+    semantic_names = {
+        *(_normalize_semantic_name(name) for name in _UNIT_PRICE_NAMES_ZH),
+        *(_normalize_semantic_name(name) for name in _UNIT_PRICE_NAMES_EN),
+    }
+    return any(normalized == name or normalized.endswith(name) for name in semantic_names)
+
+
+def get_ratio_dependency_options(
+    saved_kpis: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Return saved and valid basic KPIs allowed as ratio dependencies."""
+    return [
+        dict(item)
+        for item in saved_kpis or []
+        if isinstance(item, dict)
+        and str(item.get("kpi_id", "")).strip()
+        and str(item.get("lifecycle_status", "saved")).strip().lower() == "saved"
+        and str(item.get("validation_status", "")).strip().lower() == "valid"
+        and str(item.get("aggregation", "")).strip().lower()
+        in BASIC_KPI_AGGREGATIONS
+    ]
+
+
+def infer_ratio_field_type(
+    numerator_kpi: dict[str, Any] | None,
+    denominator_kpi: dict[str, Any] | None,
+) -> str:
+    """Infer the minimal V1 result type for a ratio definition."""
+    numerator_type = str((numerator_kpi or {}).get("field_type", "")).strip().lower()
+    denominator_type = str((denominator_kpi or {}).get("field_type", "")).strip().lower()
+    denominator_aggregation = str(
+        (denominator_kpi or {}).get("aggregation", "")
+    ).strip().lower()
+    quantity_like_denominator = (
+        denominator_aggregation in {"count", "count_rows", "count_distinct"}
+        or denominator_type in {"numeric", "number", "quantity", "id", "row"}
+    )
+    return "amount" if numerator_type == "amount" and quantity_like_denominator else "numeric"
+
+
+def format_kpi_source_or_formula(
+    kpi: dict[str, Any],
+    kpi_by_id: dict[str, dict[str, Any]] | None = None,
+    *,
+    no_source_field_label: str = NO_SOURCE_FIELD_LABEL,
+) -> str:
+    """Return a readable source field or ratio formula without exposing IDs."""
+    if str(kpi.get("aggregation", "")).strip().lower() != "ratio":
+        return str(kpi.get("source_field", "")).strip() or no_source_field_label
+    dependencies = kpi_by_id or {}
+    numerator = dependencies.get(str(kpi.get("numerator_kpi_id", "")).strip(), {})
+    denominator = dependencies.get(str(kpi.get("denominator_kpi_id", "")).strip(), {})
+    numerator_name = str(numerator.get("kpi_name", "")).strip() or "分子指标不可用"
+    denominator_name = str(denominator.get("kpi_name", "")).strip() or "分母指标不可用"
+    return f"{numerator_name} ÷ {denominator_name}"
+
+
+def get_ratio_dependents(
+    saved_kpis: list[dict[str, Any]] | None,
+    dependency_kpi_id: str,
+) -> list[dict[str, Any]]:
+    """Return ratio KPIs that directly reference a basic KPI."""
+    target = str(dependency_kpi_id or "").strip()
+    return [
+        dict(item)
+        for item in saved_kpis or []
+        if isinstance(item, dict)
+        and str(item.get("aggregation", "")).strip().lower() == "ratio"
+        and target
+        in {
+            str(item.get("numerator_kpi_id", "")).strip(),
+            str(item.get("denominator_kpi_id", "")).strip(),
+        }
+    ]
+
+
+def is_legacy_single_field_aov_kpi(kpi: dict[str, Any]) -> bool:
+    """Identify saved legacy AOV definitions that averaged one amount field."""
+    return (
+        str(kpi.get("kpi_name", "")).strip() == "客单价"
+        and str(kpi.get("aggregation", "")).strip().lower() == "avg"
+        and str(kpi.get("field_type", "")).strip().lower() == "amount"
+        and bool(str(kpi.get("source_field", "")).strip())
+    )
+
+
+def generate_aov_ratio_recommendation(
+    saved_kpis: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Recommend one high-confidence saved-KPI AOV ratio, without persistence."""
+    saved = [dict(item) for item in saved_kpis or [] if isinstance(item, dict)]
+    dependencies = get_ratio_dependency_options(saved)
+    numerators = [
+        item
+        for item in dependencies
+        if str(item.get("aggregation", "")).strip().lower() == "sum"
+        and str(item.get("field_type", "")).strip().lower() == "amount"
+        and _normalize_semantic_name(item.get("kpi_name"))
+        in {_normalize_semantic_name(name) for name in _AOV_NUMERATOR_NAMES}
+    ]
+    denominators = [
+        item
+        for item in dependencies
+        if str(item.get("aggregation", "")).strip().lower()
+        in {"sum", "count_distinct"}
+        and _normalize_semantic_name(item.get("kpi_name"))
+        in {_normalize_semantic_name(name) for name in _AOV_DENOMINATOR_NAMES}
+    ]
+    if any(str(item.get("kpi_name", "")).strip() == "客单价" for item in saved):
+        return {"status": "already_defined", "candidates": [], "message": ""}
+    if len(numerators) > 1 or len(denominators) > 1:
+        return {
+            "status": "ambiguous",
+            "candidates": [],
+            "message": "检测到多个可能的销售额或客户数量指标，暂不自动推荐客单价，请手动确认分子和分母。",
+        }
+    if len(numerators) != 1 or len(denominators) != 1:
+        return {"status": "insufficient_dependencies", "candidates": [], "message": ""}
+    numerator = numerators[0]
+    denominator = denominators[0]
+    numerator_id = str(numerator.get("kpi_id", "")).strip()
+    denominator_id = str(denominator.get("kpi_id", "")).strip()
+    if any(
+        str(item.get("aggregation", "")).strip().lower() == "ratio"
+        and str(item.get("numerator_kpi_id", "")).strip() == numerator_id
+        and str(item.get("denominator_kpi_id", "")).strip() == denominator_id
+        for item in saved
+    ):
+        return {"status": "already_defined", "candidates": [], "message": ""}
+    candidate = _kpi(
+        kpi_name="客单价",
+        aggregation="ratio",
+        source_field="",
+        field_type=infer_ratio_field_type(numerator, denominator),
+        category="核心指标",
+        description="使用已保存指标计算：销售额 ÷ 成交客户数。",
+        enabled=False,
+        numerator_kpi_id=numerator_id,
+        denominator_kpi_id=denominator_id,
+    )
+    return {"status": "recommended", "candidates": [candidate], "message": ""}
 
 
 def get_kpi_source_field_type(
@@ -288,7 +461,11 @@ def generate_kpi_candidates(
         for item in field_mappings or []
         if item.get("column_name") and item.get("confirmed_type") != "忽略字段"
     ]
-    amount_fields = list(dict.fromkeys(_columns_by_type(mappings, "金额字段")))
+    amount_fields = [
+        field
+        for field in dict.fromkeys(_columns_by_type(mappings, "金额字段"))
+        if not is_unit_price_field(field)
+    ]
     quantity_fields = _additive_quantity_fields(mappings, dataframe)
     id_fields = _columns_by_type(mappings, "ID字段")
     date_fields = [
@@ -328,12 +505,12 @@ def generate_kpi_candidates(
         )
         candidates.append(
             _kpi(
-                kpi_name="客单价" if index == 0 else f"{field}平均值",
+                kpi_name=f"{field}平均值",
                 aggregation="avg",
                 source_field=field,
                 field_type="amount",
                 category="核心指标",
-                description="V1 使用金额字段 AVG 定义；复杂公式后续支持。",
+                description=f"统计金额字段 `{field}` 的平均值。",
                 enabled=False,
             )
         )
@@ -902,6 +1079,8 @@ def _kpi(
     category: str,
     description: str,
     enabled: bool,
+    numerator_kpi_id: str = "",
+    denominator_kpi_id: str = "",
 ) -> dict[str, Any]:
     return normalize_kpi_definition(
         {
@@ -914,6 +1093,8 @@ def _kpi(
             "kpi_name": kpi_name,
             "aggregation": aggregation,
             "source_field": source_field,
+            "numerator_kpi_id": numerator_kpi_id,
+            "denominator_kpi_id": denominator_kpi_id,
             "field_type": field_type,
             "category": category,
             "description": description,
@@ -1039,6 +1220,10 @@ def _field_name_tokens(column_name: str) -> list[str]:
     return re.findall(r"[a-z0-9]+", with_camel_boundaries.casefold())
 
 
+def _normalize_semantic_name(value: Any) -> str:
+    return re.sub(r"[\s_\-]+", "", str(value or "").strip().casefold())
+
+
 def _is_derived_time_mapping(
     column_name: str,
     dataframe: pd.DataFrame | None,
@@ -1130,10 +1315,12 @@ def _json_safe_scalar(value: Any) -> Any:
     return value
 
 
-def _kpi_key(kpi: dict[str, Any]) -> tuple[str, str, str, str]:
+def _kpi_key(kpi: dict[str, Any]) -> tuple[str, str, str, str, str, str]:
     return (
         str(kpi.get("kpi_name", "")),
         str(kpi.get("aggregation", "")),
         str(kpi.get("source_field", "")),
         str(kpi.get("category", "")),
+        str(kpi.get("numerator_kpi_id", "")),
+        str(kpi.get("denominator_kpi_id", "")),
     )

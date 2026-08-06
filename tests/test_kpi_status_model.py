@@ -522,7 +522,11 @@ class KpiPersistedStatusModelTests(unittest.TestCase):
         valid = next(item for item in candidates if item["kpi_name"] == "销售额")
         pending = next(item for item in candidates if item["aggregation"] == "reserved")
         invalid = {
-            **next(item for item in candidates if item["kpi_name"] == "客单价"),
+            **next(
+                item
+                for item in candidates
+                if item["kpi_name"] == "成交金额平均值"
+            ),
             "aggregation": "median",
         }
 

@@ -12,6 +12,14 @@ from src.engines.kpi_engine import (
     SUPPORTED_AGGREGATIONS,
     calculate_basic_kpi,
     calculate_ratio_kpi,
+    format_kpi_source_or_formula,
+    generate_aov_ratio_recommendation,
+    generate_kpi_candidates,
+    get_ratio_dependency_options,
+    get_ratio_dependents,
+    infer_ratio_field_type,
+    is_legacy_single_field_aov_kpi,
+    is_unit_price_field,
     normalize_kpi_definition,
     validate_kpi_definition,
 )
@@ -19,6 +27,7 @@ from src.engines.metric_dictionary_engine import generate_metric_candidates_from
 from src.services.field_mapping_service import save_field_mappings
 from src.services.kpi_service import (
     delete_kpi_definition,
+    generate_project_kpi_candidates,
     list_usable_kpis,
     load_kpi_definitions,
     save_kpi_definitions,
@@ -187,6 +196,141 @@ class KpiRatioDefinitionTests(unittest.TestCase):
         )
 
         self.assertEqual(result["validation_status"], "valid")
+
+    def test_dependency_options_only_include_saved_valid_basic_kpis(self):
+        options = get_ratio_dependency_options(
+            [
+                _base_kpi("sales", enabled=False),
+                _base_kpi("candidate", lifecycle_status="candidate"),
+                _base_kpi("invalid", validation_status="invalid"),
+                _base_kpi("reserved", aggregation="reserved"),
+                _ratio_kpi(),
+            ]
+        )
+
+        self.assertEqual([item["kpi_id"] for item in options], ["sales"])
+        self.assertFalse(options[0]["enabled"])
+
+    def test_ratio_field_type_and_formula_are_derived_from_dependencies(self):
+        numerator = _base_kpi("sales", kpi_name="销售额")
+        denominator = _base_kpi(
+            "customers",
+            kpi_name="成交客户数",
+            source_field="成交客户数",
+            field_type="numeric",
+        )
+        ratio = _ratio_kpi()
+
+        self.assertEqual(infer_ratio_field_type(numerator, denominator), "amount")
+        self.assertEqual(
+            format_kpi_source_or_formula(
+                ratio, {"sales": numerator, "customers": denominator}
+            ),
+            "销售额 ÷ 成交客户数",
+        )
+        self.assertNotIn("sales", format_kpi_source_or_formula(
+            ratio, {"sales": numerator, "customers": denominator}
+        ))
+
+    def test_ratio_dependents_are_reported_without_cascade_changes(self):
+        saved = [_base_kpi("sales"), _ratio_kpi()]
+        before = copy.deepcopy(saved)
+
+        dependents = get_ratio_dependents(saved, "sales")
+
+        self.assertEqual([item["kpi_id"] for item in dependents], ["ratio-aov"])
+        self.assertEqual(saved, before)
+
+
+class KpiAovRecommendationTests(unittest.TestCase):
+    def setUp(self):
+        self.sales = _base_kpi("sales", kpi_name="销售额")
+        self.customers = _base_kpi(
+            "customers",
+            kpi_name="成交客户数",
+            source_field="成交客户数",
+            field_type="numeric",
+        )
+
+    def test_aov_requires_exactly_one_high_confidence_saved_pair(self):
+        missing = generate_aov_ratio_recommendation([self.sales])
+        result = generate_aov_ratio_recommendation([self.sales, self.customers])
+        candidate = result["candidates"][0]
+
+        self.assertEqual(missing["candidates"], [])
+        self.assertEqual(result["status"], "recommended")
+        self.assertEqual(candidate["kpi_name"], "客单价")
+        self.assertEqual(candidate["aggregation"], "ratio")
+        self.assertEqual(candidate["numerator_kpi_id"], "sales")
+        self.assertEqual(candidate["denominator_kpi_id"], "customers")
+        self.assertEqual(candidate["field_type"], "amount")
+        self.assertEqual(candidate["validation_status"], "pending")
+        self.assertFalse(candidate["enabled"])
+
+    def test_ambiguity_existing_name_or_existing_formula_suppresses_candidate(self):
+        ambiguous = generate_aov_ratio_recommendation(
+            [self.sales, _base_kpi("revenue", kpi_name="Revenue"), self.customers]
+        )
+        existing_name = generate_aov_ratio_recommendation(
+            [self.sales, self.customers, _base_kpi("legacy", kpi_name="客单价")]
+        )
+        existing_formula = generate_aov_ratio_recommendation(
+            [self.sales, self.customers, _ratio_kpi(kpi_name="平均成交额")]
+        )
+
+        self.assertEqual(ambiguous["status"], "ambiguous")
+        self.assertIn("多个可能", ambiguous["message"])
+        self.assertEqual(existing_name["candidates"], [])
+        self.assertEqual(existing_formula["candidates"], [])
+
+    def test_record_count_and_sales_people_are_not_aov_denominators(self):
+        for denominator in (
+            _base_kpi("rows", kpi_name="记录数", aggregation="count_rows", source_field="", field_type="row"),
+            _base_kpi("people", kpi_name="销售人员数", aggregation="count_distinct", source_field="销售工号", field_type="id"),
+        ):
+            self.assertEqual(
+                generate_aov_ratio_recommendation([self.sales, denominator])["candidates"],
+                [],
+            )
+
+    def test_unit_price_fields_generate_no_sum_or_avg_candidates(self):
+        mappings = [
+            {"column_name": name, "confirmed_type": "金额字段"}
+            for name in (
+                "客单价",
+                "产品单价",
+                "均价",
+                "平均订单金额",
+                "AOV",
+                "unit_price",
+                "average_price",
+            )
+        ] + [{"column_name": "成交金额", "confirmed_type": "金额字段"}]
+
+        candidates = generate_kpi_candidates(mappings)
+        sources = {
+            item["source_field"]
+            for item in candidates
+            if item["aggregation"] in {"sum", "avg"}
+        }
+
+        self.assertEqual(sources, {"成交金额"})
+        self.assertNotIn("客单价", {item["kpi_name"] for item in candidates})
+        for name in ("客单价", "产品单价", "AOV", "unit_price"):
+            self.assertTrue(is_unit_price_field(name))
+
+    def test_legacy_single_field_aov_is_detected_but_not_modified(self):
+        legacy = _base_kpi(
+            "legacy",
+            kpi_name="客单价",
+            aggregation="avg",
+            source_field="成交金额",
+            field_type="amount",
+        )
+        before = copy.deepcopy(legacy)
+
+        self.assertTrue(is_legacy_single_field_aov_kpi(legacy))
+        self.assertEqual(legacy, before)
 
 
 class KpiRatioExecutionTests(unittest.TestCase):
@@ -434,6 +578,54 @@ class KpiRatioPersistenceTests(unittest.TestCase):
         )[0]
 
         self.assertEqual(candidate["business_definition"], "销售额除以成交客户数")
+
+    def test_project_candidate_adds_aov_only_after_both_base_kpis_are_saved(self):
+        save_kpi_definitions(
+            self.project_id,
+            [
+                {**self.sales, "kpi_name": "销售额"},
+                {**self.customers, "kpi_name": "成交客户数"},
+            ],
+            available_fields=["成交金额", "成交客户数"],
+        )
+
+        candidates = generate_project_kpi_candidates(
+            self.project_id,
+            dataframe=pd.DataFrame(
+                {"成交金额": [100], "成交客户数": [2]}
+            ),
+        )
+        aov = next(item for item in candidates if item["kpi_name"] == "客单价")
+
+        self.assertEqual(aov["aggregation"], "ratio")
+        self.assertEqual(aov["numerator_kpi_id"], "sales")
+        self.assertEqual(aov["denominator_kpi_id"], "customers")
+
+    def test_metric_dictionary_has_readable_formula_and_sum_grain_note(self):
+        sales = {**self.sales, "kpi_name": "销售额", "lifecycle_status": "saved"}
+        customers = {
+            **self.customers,
+            "kpi_name": "成交客户数",
+            "lifecycle_status": "saved",
+        }
+        ratio = {
+            **self.ratio,
+            "kpi_name": "客单价",
+            "lifecycle_status": "saved",
+        }
+
+        candidate = next(
+            item
+            for item in generate_metric_candidates_from_kpis(
+                [sales, customers, ratio]
+            )
+            if item["metric_name"] == "客单价"
+        )
+
+        self.assertEqual(candidate["formula_summary"], "销售额 ÷ 成交客户数")
+        self.assertIn("销售额除以成交客户数", candidate["business_definition"])
+        self.assertIn("取决于当前数据粒度", candidate["business_definition"])
+        self.assertNotIn("sales", candidate["formula_summary"])
 
 
 if __name__ == "__main__":

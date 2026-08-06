@@ -122,7 +122,10 @@ def test_source_and_field_type_controls_rerun_before_form_submission():
     assert source_control < form_start
     assert field_type_control < form_start
     assert "get_kpi_source_field_type(" in KPI_TAB_SOURCE
-    assert '"字段类型",\n            [new_field_type],\n            disabled=True' in KPI_TAB_SOURCE
+    field_type_block = KPI_TAB_SOURCE[field_type_control:form_start]
+    assert '"字段类型"' in field_type_block
+    assert "[new_field_type]" in field_type_block
+    assert "disabled=True" in field_type_block
 
 
 def test_new_form_state_is_project_scoped_and_invalid_source_is_reset():

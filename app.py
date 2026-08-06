@@ -49,7 +49,13 @@ from src.engines.kpi_engine import (
     NO_SOURCE_FIELD_LABEL,
     RESERVED_AGGREGATION,
     SUPPORTED_AGGREGATIONS,
+    format_kpi_source_or_formula,
+    generate_aov_ratio_recommendation,
+    get_ratio_dependency_options,
+    get_ratio_dependents,
     get_kpi_source_field_type,
+    infer_ratio_field_type,
+    is_legacy_single_field_aov_kpi,
     resolve_kpi_source_selection,
     missing_entity_id_candidate_names,
 )
@@ -3738,10 +3744,13 @@ def render_kpi_center_tab(
         st.caption(
             "当前字段映射中未识别到订单 ID 或客户 ID，因此未生成订单数或客户数的去重计数候选。数量字段与 ID 字段口径不同，例如‘成交客户数’通常应按业务定义求和，而不是去重计数。"
         )
+    aov_recommendation = generate_aov_ratio_recommendation(saved_kpis)
+    if aov_recommendation["status"] == "ambiguous":
+        st.caption(aov_recommendation["message"])
     no_source_field_label = NO_SOURCE_FIELD_LABEL
-    source_field_options = [no_source_field_label] + [
-        str(column) for column in dataframe.columns
-    ]
+    saved_kpi_by_id = {
+        str(item.get("kpi_id", "")): item for item in saved_kpis
+    }
     aggregation_options = [
         AGGREGATION_LABELS[value]
         for value in (*SUPPORTED_AGGREGATIONS, RESERVED_AGGREGATION)
@@ -3767,7 +3776,9 @@ def render_kpi_center_tab(
                     "聚合方式": AGGREGATION_LABELS.get(
                         item["aggregation"], item["aggregation"]
                     ),
-                    "来源字段": item["source_field"] or no_source_field_label,
+                    "来源字段／公式": format_kpi_source_or_formula(
+                        item, saved_kpi_by_id
+                    ),
                     "字段类型": item["field_type"],
                     "推荐说明": item["description"],
                     "当前状态": "待确认",
@@ -3785,7 +3796,7 @@ def render_kpi_center_tab(
                 "指标名称",
                 "分类",
                 "聚合方式",
-                "来源字段",
+                "来源字段／公式",
                 "字段类型",
                 "推荐说明",
                 "当前状态",
@@ -3800,8 +3811,8 @@ def render_kpi_center_tab(
                     "聚合方式",
                     options=aggregation_options,
                 ),
-                "来源字段": st.column_config.SelectboxColumn(
-                    "来源字段", options=source_field_options
+                "来源字段／公式": st.column_config.TextColumn(
+                    "来源字段／公式"
                 ),
                 "字段类型": st.column_config.SelectboxColumn(
                     "字段类型",
@@ -3834,16 +3845,25 @@ def render_kpi_center_tab(
                 aggregation = aggregation_by_label.get(
                     row.get("聚合方式", ""), row.get("聚合方式", "")
                 )
-                source_field = (
-                    ""
-                    if aggregation == "count_rows"
-                    or row.get("来源字段") == no_source_field_label
-                    else row.get("来源字段", "")
-                )
+                if original_item.get("aggregation") == "ratio":
+                    aggregation = "ratio"
+                    source_field = ""
+                else:
+                    displayed_source = row.get("来源字段／公式", "")
+                    source_field = (
+                        ""
+                        if aggregation == "count_rows"
+                        or displayed_source == no_source_field_label
+                        else displayed_source
+                    )
                 field_type = (
                     "row"
                     if aggregation == "count_rows"
-                    else row.get("字段类型", "custom")
+                    else (
+                        original_item.get("field_type", "numeric")
+                        if aggregation == "ratio"
+                        else row.get("字段类型", "custom")
+                    )
                 )
                 selected_candidates.append(
                     {
@@ -3913,7 +3933,9 @@ def render_kpi_center_tab(
                     "聚合方式": AGGREGATION_LABELS.get(
                         item["aggregation"], item["aggregation"]
                     ),
-                    "来源字段": item["source_field"] or no_source_field_label,
+                    "来源字段／公式": format_kpi_source_or_formula(
+                        item, saved_kpi_by_id
+                    ),
                     "字段类型": item["field_type"],
                     "描述": item["description"],
                     "启用状态": bool(item["enabled"]),
@@ -3939,7 +3961,7 @@ def render_kpi_center_tab(
                 "指标名称",
                 "分类",
                 "聚合方式",
-                "来源字段",
+                "来源字段／公式",
                 "字段类型",
                 "描述",
                 "启用状态",
@@ -3957,8 +3979,8 @@ def render_kpi_center_tab(
                     "聚合方式",
                     options=aggregation_options,
                 ),
-                "来源字段": st.column_config.SelectboxColumn(
-                    "来源字段", options=source_field_options
+                "来源字段／公式": st.column_config.TextColumn(
+                    "来源字段／公式"
                 ),
                 "字段类型": st.column_config.SelectboxColumn(
                     "字段类型",
@@ -3989,16 +4011,25 @@ def render_kpi_center_tab(
                 aggregation = aggregation_by_label.get(
                     row.get("聚合方式", ""), row.get("聚合方式", "")
                 )
-                source_field = (
-                    ""
-                    if aggregation == "count_rows"
-                    or row.get("来源字段") == no_source_field_label
-                    else row.get("来源字段", "")
-                )
+                if original_item.get("aggregation") == "ratio":
+                    aggregation = "ratio"
+                    source_field = ""
+                else:
+                    displayed_source = row.get("来源字段／公式", "")
+                    source_field = (
+                        ""
+                        if aggregation == "count_rows"
+                        or displayed_source == no_source_field_label
+                        else displayed_source
+                    )
                 field_type = (
                     "row"
                     if aggregation == "count_rows"
-                    else row.get("字段类型", "custom")
+                    else (
+                        original_item.get("field_type", "numeric")
+                        if aggregation == "ratio"
+                        else row.get("字段类型", "custom")
+                    )
                 )
                 definitions.append(
                     {
@@ -4033,12 +4064,152 @@ def render_kpi_center_tab(
             st.caption(
                 "已保存规则中存在非空计数指标。如需统计唯一订单、客户或人员，请将聚合方式改为去重计数。"
             )
+        legacy_aov_kpis = [
+            item for item in saved_kpis if is_legacy_single_field_aov_kpi(item)
+        ]
+        if legacy_aov_kpis:
+            st.warning(
+                "检测到旧版‘客单价’规则使用单个金额字段平均值计算。该配置会继续保留且不会自动迁移；"
+                "如需使用销售额 ÷ 成交客户数口径，请新增或改用比率 KPI。"
+            )
     else:
         st.info("当前尚未保存正式指标。请从自动推荐候选中选择保存，或新增自定义指标。")
 
+    ratio_kpis = [
+        item for item in saved_kpis if item.get("aggregation") == "ratio"
+    ]
+    if ratio_kpis:
+        st.subheader("编辑比率指标")
+        ratio_options = {item["kpi_id"]: item["kpi_name"] for item in ratio_kpis}
+        edit_ratio_id = st.selectbox(
+            "选择比率指标",
+            list(ratio_options),
+            format_func=lambda value: ratio_options[value],
+            key=f"edit_ratio_select_{project_id}_{saved_signature}",
+        )
+        editing_ratio = saved_kpi_by_id[edit_ratio_id]
+        dependency_options = get_ratio_dependency_options(saved_kpis)
+        dependency_by_id = {
+            item["kpi_id"]: item for item in dependency_options
+        }
+        dependency_ids = list(dependency_by_id)
+        if len(dependency_ids) < 2:
+            st.info("至少需要两个已保存且校验通过的基础 KPI，才能编辑比率指标。")
+        else:
+            numerator_key = f"edit_ratio_numerator_{project_id}_{edit_ratio_id}"
+            denominator_key = f"edit_ratio_denominator_{project_id}_{edit_ratio_id}"
+            default_numerator = str(editing_ratio.get("numerator_kpi_id", ""))
+            if default_numerator not in dependency_ids:
+                default_numerator = dependency_ids[0]
+            if st.session_state.get(numerator_key) not in dependency_ids:
+                st.session_state[numerator_key] = default_numerator
+            default_denominator = str(editing_ratio.get("denominator_kpi_id", ""))
+            if default_denominator not in dependency_ids or default_denominator == default_numerator:
+                default_denominator = next(
+                    item for item in dependency_ids if item != default_numerator
+                )
+            if st.session_state.get(denominator_key) not in dependency_ids:
+                st.session_state[denominator_key] = default_denominator
+            edit_dependency_columns = st.columns(2)
+            edit_numerator_id = edit_dependency_columns[0].selectbox(
+                "分子 KPI",
+                dependency_ids,
+                format_func=lambda value: dependency_by_id[value]["kpi_name"],
+                key=numerator_key,
+            )
+            edit_denominator_id = edit_dependency_columns[1].selectbox(
+                "分母 KPI",
+                dependency_ids,
+                format_func=lambda value: dependency_by_id[value]["kpi_name"],
+                key=denominator_key,
+            )
+            same_dependency = edit_numerator_id == edit_denominator_id
+            if same_dependency:
+                st.error("比率 KPI 的分子和分母不能选择同一个指标。")
+            edit_ratio_type = infer_ratio_field_type(
+                dependency_by_id[edit_numerator_id],
+                dependency_by_id[edit_denominator_id],
+            )
+            st.caption(
+                "公式预览："
+                f"{dependency_by_id[edit_numerator_id]['kpi_name']} ÷ "
+                f"{dependency_by_id[edit_denominator_id]['kpi_name']}"
+            )
+            edit_meta_columns = st.columns(2)
+            edit_name = edit_meta_columns[0].text_input(
+                "指标名称",
+                value=editing_ratio["kpi_name"],
+                key=f"edit_ratio_name_{project_id}_{edit_ratio_id}",
+            )
+            edit_category = edit_meta_columns[1].selectbox(
+                "分类",
+                list(KPI_CATEGORIES),
+                index=list(KPI_CATEGORIES).index(editing_ratio["category"]),
+                key=f"edit_ratio_category_{project_id}_{edit_ratio_id}",
+            )
+            edit_description = st.text_input(
+                "描述",
+                value=editing_ratio.get("description", ""),
+                key=f"edit_ratio_description_{project_id}_{edit_ratio_id}",
+            )
+            edit_status_columns = st.columns(3)
+            edit_status_columns[0].text_input(
+                "来源字段",
+                value=NO_SOURCE_FIELD_LABEL,
+                disabled=True,
+                key=f"edit_ratio_source_{project_id}_{edit_ratio_id}",
+            )
+            edit_status_columns[1].text_input(
+                "结果字段类型",
+                value=edit_ratio_type,
+                disabled=True,
+                key=f"edit_ratio_type_{project_id}_{edit_ratio_id}_{edit_ratio_type}",
+            )
+            edit_enabled = edit_status_columns[2].checkbox(
+                "启用",
+                value=bool(editing_ratio.get("enabled", False)),
+                key=f"edit_ratio_enabled_{project_id}_{edit_ratio_id}",
+            )
+            if st.button(
+                "保存比率指标修改",
+                type="primary",
+                disabled=same_dependency or not edit_name.strip(),
+                key=f"save_ratio_edit_{project_id}_{edit_ratio_id}_{saved_signature}",
+            ):
+                edited_definitions = [
+                    {
+                        **item,
+                        **(
+                            {
+                                "kpi_name": edit_name,
+                                "category": edit_category,
+                                "aggregation": "ratio",
+                                "source_field": "",
+                                "numerator_kpi_id": edit_numerator_id,
+                                "denominator_kpi_id": edit_denominator_id,
+                                "field_type": edit_ratio_type,
+                                "description": edit_description,
+                                "enabled": edit_enabled,
+                            }
+                            if item.get("kpi_id") == edit_ratio_id
+                            else {}
+                        ),
+                    }
+                    for item in saved_kpis
+                ]
+                save_edited_kpi_definitions(
+                    project_id,
+                    edited_definitions,
+                    available_fields=available_fields,
+                )
+                st.session_state[notice_key] = [
+                    {"level": "success", "message": "比率指标修改已保存。"}
+                ]
+                st.rerun()
+
     st.subheader("新增指标计算规则")
     st.caption(
-        "支持求和、非空计数、记录行数、去重计数、平均值、最大值和最小值。客单价等复杂公式将在后续任务处理。"
+        "支持基础聚合和两个已保存基础 KPI 之间的比率计算。"
     )
     new_aggregation = st.selectbox(
         "聚合方式",
@@ -4049,45 +4220,105 @@ def render_kpi_center_tab(
     aggregation_help = AGGREGATION_HELP_TEXTS.get(new_aggregation)
     if aggregation_help:
         st.caption(aggregation_help)
-    source_state_key = f"add_kpi_source_field_{project_id}"
-    source_selection = resolve_kpi_source_selection(
-        new_aggregation,
-        st.session_state.get(source_state_key),
-        available_fields,
-        field_mappings,
-        kpi_field_roles,
-    )
-    selected_source_options = source_selection["options"]
-    has_compatible_fields = source_selection["has_compatible_fields"]
-    if has_compatible_fields:
-        if st.session_state.get(source_state_key) != source_selection["selected_option"]:
-            st.session_state[source_state_key] = source_selection["selected_option"]
-        source_columns = st.columns(2)
-        new_source_field = source_columns[0].selectbox(
+    new_numerator_kpi_id = ""
+    new_denominator_kpi_id = ""
+    if new_aggregation == "ratio":
+        ratio_dependency_options = get_ratio_dependency_options(saved_kpis)
+        ratio_dependency_by_id = {
+            item["kpi_id"]: item for item in ratio_dependency_options
+        }
+        ratio_dependency_ids = list(ratio_dependency_by_id)
+        has_compatible_fields = len(ratio_dependency_ids) >= 2
+        new_source_field = ""
+        if has_compatible_fields:
+            numerator_state_key = f"add_ratio_numerator_{project_id}"
+            denominator_state_key = f"add_ratio_denominator_{project_id}"
+            if st.session_state.get(numerator_state_key) not in ratio_dependency_ids:
+                st.session_state[numerator_state_key] = ratio_dependency_ids[0]
+            if st.session_state.get(denominator_state_key) not in ratio_dependency_ids:
+                st.session_state[denominator_state_key] = ratio_dependency_ids[1]
+            ratio_columns = st.columns(2)
+            new_numerator_kpi_id = ratio_columns[0].selectbox(
+                "分子 KPI",
+                ratio_dependency_ids,
+                format_func=lambda value: ratio_dependency_by_id[value]["kpi_name"],
+                key=numerator_state_key,
+            )
+            new_denominator_kpi_id = ratio_columns[1].selectbox(
+                "分母 KPI",
+                ratio_dependency_ids,
+                format_func=lambda value: ratio_dependency_by_id[value]["kpi_name"],
+                key=denominator_state_key,
+            )
+            same_dependency = new_numerator_kpi_id == new_denominator_kpi_id
+            if same_dependency:
+                st.error("比率 KPI 的分子和分母不能选择同一个指标。")
+            new_field_type = infer_ratio_field_type(
+                ratio_dependency_by_id[new_numerator_kpi_id],
+                ratio_dependency_by_id[new_denominator_kpi_id],
+            )
+            st.caption(
+                "公式预览："
+                f"{ratio_dependency_by_id[new_numerator_kpi_id]['kpi_name']} ÷ "
+                f"{ratio_dependency_by_id[new_denominator_kpi_id]['kpi_name']}"
+            )
+            has_compatible_fields = not same_dependency
+        else:
+            new_field_type = "numeric"
+            st.info("至少需要两个已保存且校验通过的基础 KPI，才能新增比率指标。")
+        ratio_display_columns = st.columns(2)
+        ratio_display_columns[0].text_input(
             "来源字段",
-            selected_source_options,
-            disabled=new_aggregation == "count_rows",
-            key=source_state_key,
+            value=NO_SOURCE_FIELD_LABEL,
+            disabled=True,
+            key=f"add_ratio_source_{project_id}",
         )
-        new_field_type = get_kpi_source_field_type(
+        ratio_display_columns[1].text_input(
+            "结果字段类型",
+            value=new_field_type,
+            disabled=True,
+            key=f"add_ratio_field_type_{project_id}_{new_field_type}",
+        )
+    else:
+        source_state_key = f"add_kpi_source_field_{project_id}"
+        source_selection = resolve_kpi_source_selection(
             new_aggregation,
-            "" if new_aggregation == "count_rows" else new_source_field,
+            st.session_state.get(source_state_key),
+            available_fields,
             field_mappings,
             kpi_field_roles,
         )
-        source_columns[1].selectbox(
-            "字段类型",
-            [new_field_type],
-            disabled=True,
-            key=(
-                f"add_kpi_field_type_{project_id}_{new_aggregation}_"
-                f"{new_source_field}_{new_field_type}"
-            ),
-        )
-    else:
-        new_source_field = ""
-        new_field_type = "custom"
-        st.info("当前分析数据集中没有适用于该聚合方式的字段。")
+        selected_source_options = source_selection["options"]
+        has_compatible_fields = source_selection["has_compatible_fields"]
+        if has_compatible_fields:
+            if st.session_state.get(source_state_key) != source_selection["selected_option"]:
+                st.session_state[source_state_key] = source_selection["selected_option"]
+            source_columns = st.columns(2)
+            new_source_field = source_columns[0].selectbox(
+                "来源字段",
+                selected_source_options,
+                disabled=new_aggregation == "count_rows",
+                key=source_state_key,
+            )
+            new_field_type = get_kpi_source_field_type(
+                new_aggregation,
+                "" if new_aggregation == "count_rows" else new_source_field,
+                field_mappings,
+                kpi_field_roles,
+            )
+            source_columns[1].selectbox(
+                "字段类型",
+                [new_field_type],
+                disabled=True,
+                key=(
+                    f"add_kpi_field_type_{project_id}_{new_aggregation}_"
+                    f"{new_source_field}_{new_field_type}"
+                ),
+            )
+        else:
+            new_source_field = ""
+            new_field_type = "custom"
+            st.info("当前分析数据集中没有适用于该聚合方式的字段。")
 
     with st.form(f"add_kpi_form_{project_id}"):
         add_columns = st.columns(2)
@@ -4112,9 +4343,11 @@ def render_kpi_center_tab(
                             "aggregation": new_aggregation,
                             "source_field": (
                                 ""
-                                if new_aggregation == "count_rows"
+                                if new_aggregation in {"count_rows", "ratio"}
                                 else new_source_field
                             ),
+                            "numerator_kpi_id": new_numerator_kpi_id,
+                            "denominator_kpi_id": new_denominator_kpi_id,
                             "field_type": new_field_type,
                             "description": new_description,
                             "created_by": "user",
@@ -4139,15 +4372,39 @@ def render_kpi_center_tab(
 
     st.subheader("删除指标计算规则")
     if saved_kpis:
-        delete_options = {item["kpi_id"]: f"{item['kpi_name']} · {item['source_field'] or '无需来源字段'}" for item in saved_kpis}
+        delete_options = {
+            item["kpi_id"]: (
+                f"{item['kpi_name']} · "
+                f"{format_kpi_source_or_formula(item, saved_kpi_by_id)}"
+            )
+            for item in saved_kpis
+        }
         delete_kpi_id = st.selectbox(
             "选择要删除的指标计算规则",
             list(delete_options),
             format_func=lambda value: delete_options[value],
             key=f"delete_kpi_select_{project_id}_{saved_signature}",
         )
+        ratio_dependents = get_ratio_dependents(saved_kpis, delete_kpi_id)
+        deletion_confirmed = True
+        if ratio_dependents:
+            dependent_names = "、".join(
+                item["kpi_name"] for item in ratio_dependents
+            )
+            st.warning(
+                f"该基础 KPI 正被以下比率指标引用：{dependent_names}。删除后这些比率指标会保留，"
+                "但将变为校验异常且不可供下游使用。"
+            )
+            deletion_confirmed = st.checkbox(
+                "我已了解依赖影响，仍要删除该指标计算规则。",
+                key=(
+                    f"confirm_delete_kpi_dependency_{project_id}_"
+                    f"{delete_kpi_id}_{saved_signature}"
+                ),
+            )
         if st.button(
             "删除所选指标计算规则",
+            disabled=not deletion_confirmed,
             key=f"delete_kpi_{project_id}_{saved_signature}",
         ):
             delete_kpi_definition(project_id, delete_kpi_id)
@@ -4219,6 +4476,14 @@ def render_metric_dictionary_tab(project_id: str, show_intro: bool = True) -> No
             if item.get("linked_kpi_name")
         }
     )
+    project_kpi_by_id = {
+        str(item.get("kpi_id", "")): item for item in project_kpis
+    }
+    formula_by_kpi_id = {
+        kpi_id: format_kpi_source_or_formula(item, project_kpi_by_id)
+        for kpi_id, item in project_kpi_by_id.items()
+        if item.get("aggregation") == "ratio"
+    }
 
     summary_columns = st.columns(4)
     summary_columns[0].metric("指标定义", len(current_metrics))
@@ -4243,6 +4508,11 @@ def render_metric_dictionary_tab(project_id: str, show_intro: bool = True) -> No
                 "指标名称": item["metric_name"],
                 "指标类型": item["metric_type"],
                 "业务定义": item["business_definition"],
+                "计算公式": (
+                    formula_by_kpi_id.get(str(item.get("linked_kpi_id", "")), "")
+                    or item.get("formula_summary", "")
+                    or "—"
+                ),
                 "别名": "，".join(item.get("aliases", [])),
                 "关联指标计算规则": item.get("linked_kpi_name") or no_linked_rule_label,
                 "创建方式": "自动候选" if item.get("created_by") == "auto" else "用户定义",
@@ -4255,6 +4525,7 @@ def render_metric_dictionary_tab(project_id: str, show_intro: bool = True) -> No
             "指标名称",
             "指标类型",
             "业务定义",
+            "计算公式",
             "别名",
             "关联指标计算规则",
             "创建方式",
@@ -4264,8 +4535,8 @@ def render_metric_dictionary_tab(project_id: str, show_intro: bool = True) -> No
         metric_rows,
         use_container_width=True,
         hide_index=True,
-        column_order=["指标名称", "指标类型", "业务定义", "别名", "关联指标计算规则", "启用状态", "创建方式"],
-        disabled=["创建方式"],
+        column_order=["指标名称", "指标类型", "业务定义", "计算公式", "别名", "关联指标计算规则", "启用状态", "创建方式"],
+        disabled=["计算公式", "创建方式"],
         column_config={
             "启用状态": st.column_config.CheckboxColumn("启用状态"),
             "指标类型": st.column_config.SelectboxColumn("指标类型", options=list(METRIC_CATEGORIES)),
@@ -4289,6 +4560,9 @@ def render_metric_dictionary_tab(project_id: str, show_intro: bool = True) -> No
                     "metric_name": row["指标名称"],
                     "metric_type": row["指标类型"],
                     "business_definition": row["业务定义"],
+                    "formula_summary": (
+                        "" if row.get("计算公式") == "—" else row.get("计算公式", "")
+                    ),
                     "aliases": row["别名"],
                     "linked_kpi_name": linked_kpi_name,
                     "linked_kpi_id": kpi_id_by_name.get(linked_kpi_name, ""),

@@ -8,6 +8,7 @@ from typing import Any
 
 from src import project_workspace
 from src.engines.kpi_engine import (
+    generate_aov_ratio_recommendation,
     generate_kpi_candidates,
     merge_kpi_candidates,
     normalize_kpi_definition,
@@ -30,7 +31,11 @@ def generate_project_kpi_candidates(
             current_dataframe = load_current_analysis_dataframe(project_id)
         except (FileNotFoundError, ValueError):
             current_dataframe = None
-    return generate_kpi_candidates(mappings, dataframe=current_dataframe)
+    candidates = generate_kpi_candidates(mappings, dataframe=current_dataframe)
+    recommendation = generate_aov_ratio_recommendation(
+        load_kpi_definitions(project_id)
+    )
+    return candidates + recommendation["candidates"]
 
 
 def load_kpi_definitions(project_id: str) -> list[dict[str, Any]]:

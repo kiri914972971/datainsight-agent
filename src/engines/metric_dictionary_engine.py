@@ -26,6 +26,11 @@ def generate_metric_candidates_from_kpis(
 ) -> list[dict[str, Any]]:
     """Generate business metric dictionary candidates from KPI definitions."""
     candidates = []
+    kpi_by_id = {
+        str(item.get("kpi_id", "")): dict(item)
+        for item in kpis or []
+        if isinstance(item, dict) and item.get("kpi_id")
+    }
     for kpi in kpis or []:
         lifecycle_status = str(kpi.get("lifecycle_status", "saved")).strip()
         if lifecycle_status and lifecycle_status != "saved":
@@ -38,7 +43,8 @@ def generate_metric_candidates_from_kpis(
                 {
                     "metric_name": kpi_name,
                     "metric_type": _metric_type_from_kpi(kpi),
-                    "business_definition": _default_definition(kpi),
+                    "business_definition": _default_definition(kpi, kpi_by_id),
+                    "formula_summary": _formula_summary(kpi, kpi_by_id),
                     "aliases": _default_aliases(kpi),
                     "linked_kpi_id": str(kpi.get("kpi_id", "")),
                     "linked_kpi_name": kpi_name,
@@ -78,6 +84,7 @@ def normalize_metric_definition(metric: dict[str, Any]) -> dict[str, Any]:
         "aliases": aliases,
         "metric_type": metric_type,
         "business_definition": str(metric.get("business_definition", "")).strip(),
+        "formula_summary": str(metric.get("formula_summary", "")).strip(),
         "linked_kpi_id": str(metric.get("linked_kpi_id", "")).strip(),
         "linked_kpi_name": str(metric.get("linked_kpi_name", "")).strip(),
         "enabled": bool(metric.get("enabled", True)),
@@ -104,7 +111,10 @@ def _metric_type_from_kpi(kpi: dict[str, Any]) -> str:
     return category if category in METRIC_CATEGORIES else "核心指标"
 
 
-def _default_definition(kpi: dict[str, Any]) -> str:
+def _default_definition(
+    kpi: dict[str, Any],
+    kpi_by_id: dict[str, dict[str, Any]] | None = None,
+) -> str:
     name = str(kpi.get("kpi_name", "")).strip()
     source_field = str(kpi.get("source_field", "")).strip()
     aggregation_value = str(kpi.get("aggregation", "")).strip().lower()
@@ -116,7 +126,24 @@ def _default_definition(kpi: dict[str, Any]) -> str:
     if aggregation_value == "count":
         return f"统计字段 `{source_field}` 中非空记录的数量，不进行去重。"
     if aggregation_value == "ratio":
-        return str(kpi.get("description", "")).strip() or f"{name} 的比率指标定义"
+        formula = _formula_summary(kpi, kpi_by_id)
+        if not formula:
+            return str(kpi.get("description", "")).strip() or f"{name} 的比率指标定义"
+        definition = f"{name}表示{formula.replace(' ÷ ', '除以')}。"
+        denominator = (kpi_by_id or {}).get(
+            str(kpi.get("denominator_kpi_id", "")).strip(), {}
+        )
+        if (
+            str(denominator.get("aggregation", "")).strip().lower() == "sum"
+            and str(denominator.get("field_type", "")).strip().lower()
+            in {"numeric", "number", "quantity", "数量字段"}
+            and any(
+                keyword in str(denominator.get("kpi_name", "")).casefold()
+                for keyword in ("客户", "customer")
+            )
+        ):
+            definition += "分母采用成交客户数字段求和，口径取决于当前数据粒度。"
+        return definition
     if aggregation_value == "sum" and str(kpi.get("field_type", "")).strip() in {
         "numeric",
         "number",
@@ -154,6 +181,22 @@ def _default_aliases(kpi: dict[str, Any]) -> list[str]:
     if source_field:
         aliases.append(source_field)
     return _normalize_aliases(aliases)
+
+
+def _formula_summary(
+    kpi: dict[str, Any],
+    kpi_by_id: dict[str, dict[str, Any]] | None,
+) -> str:
+    if str(kpi.get("aggregation", "")).strip().lower() != "ratio":
+        return ""
+    dependencies = kpi_by_id or {}
+    numerator = dependencies.get(str(kpi.get("numerator_kpi_id", "")).strip(), {})
+    denominator = dependencies.get(str(kpi.get("denominator_kpi_id", "")).strip(), {})
+    numerator_name = str(numerator.get("kpi_name", "")).strip()
+    denominator_name = str(denominator.get("kpi_name", "")).strip()
+    if not numerator_name or not denominator_name:
+        return ""
+    return f"{numerator_name} ÷ {denominator_name}"
 
 
 def _normalize_aliases(value: Any) -> list[str]:
