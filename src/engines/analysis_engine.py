@@ -14,7 +14,15 @@ from src.services.kpi_service import load_kpi_definitions, merged_project_kpis
 from src.services.metric_dictionary_service import load_metric_dictionary, merged_project_metrics
 
 
-SUPPORTED_AGGREGATIONS = {"sum", "count", "avg", "max", "min"}
+SUPPORTED_AGGREGATIONS = {
+    "sum",
+    "count",
+    "count_rows",
+    "count_distinct",
+    "avg",
+    "max",
+    "min",
+}
 RESULT_FILE = "analysis_result.json"
 
 
@@ -44,7 +52,7 @@ def execute_analysis(project_id: str, parsed_intent: dict[str, Any]) -> dict[str
     )
     aggregation = _normalize_aggregation(parsed_intent.get("aggregation"))
 
-    if not metric_field and aggregation != "count":
+    if not metric_field and aggregation not in {"count", "count_rows"}:
         warnings.append(f"未能定位指标字段：{parsed_intent.get('metric') or '未提供'}")
         result = _failure_result(parsed_intent, warnings)
         _save_analysis_result(project_id, parsed_intent, result)
@@ -140,9 +148,9 @@ def _aggregate(
     aggregation: str,
     output_metric_name: str,
 ) -> pd.DataFrame:
-    if aggregation != "count" and not metric_field:
+    if aggregation not in {"count", "count_rows"} and not metric_field:
         raise ValueError("聚合计算缺少指标字段。")
-    if aggregation != "count" and metric_field not in dataframe.columns:
+    if aggregation not in {"count", "count_rows"} and metric_field not in dataframe.columns:
         raise ValueError(f"指标字段不存在：{metric_field}")
     if dimension_field and dimension_field not in dataframe.columns:
         raise ValueError(f"维度字段不存在：{dimension_field}")
@@ -156,6 +164,25 @@ def _aggregate(
             return result.reset_index(name=output_metric_name)
         value = int(dataframe[metric_field].count()) if metric_field and metric_field in dataframe.columns else int(len(dataframe))
         return pd.DataFrame([{"指标": output_metric_name, output_metric_name: value}])
+
+    if aggregation == "count_rows":
+        if dimension_field:
+            result = dataframe.groupby(dimension_field, dropna=False).size()
+            return result.reset_index(name=output_metric_name)
+        return pd.DataFrame(
+            [{"指标": output_metric_name, output_metric_name: int(len(dataframe))}]
+        )
+
+    if aggregation == "count_distinct":
+        if dimension_field:
+            result = dataframe.groupby(dimension_field, dropna=False)[
+                metric_field
+            ].nunique(dropna=True)
+            return result.reset_index(name=output_metric_name)
+        value = int(dataframe[metric_field].nunique(dropna=True))
+        return pd.DataFrame(
+            [{"指标": output_metric_name, output_metric_name: value}]
+        )
 
     numeric = pd.to_numeric(dataframe[metric_field], errors="coerce")
     working_df = dataframe.copy()

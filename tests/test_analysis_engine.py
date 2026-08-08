@@ -38,7 +38,7 @@ class AnalysisEngineTests(unittest.TestCase):
                     self.today - pd.Timedelta(days=5),
                 ],
                 "成交金额": [100, 200, 300, 50],
-                "订单ID": [1, 2, 3, 4],
+                "订单ID": [1, 1, 3, 4],
                 "客单价": [100, 200, 300, 50],
             }
         ).to_csv(analysis_path / "analysis_dataset.csv", index=False, encoding="utf-8-sig")
@@ -111,6 +111,27 @@ class AnalysisEngineTests(unittest.TestCase):
         rows = {item["区域"]: item["订单数"] for item in result["rows"]}
         self.assertEqual(rows["华东"], 3)
         self.assertEqual(rows["华南"], 1)
+
+    def test_count_distinct_and_count_rows_are_compatible(self):
+        distinct = execute_analysis(
+            self.project_id,
+            {
+                "metric": "订单数",
+                "dimension": "区域",
+                "aggregation": "count_distinct",
+            },
+        )
+        rows = execute_analysis(
+            self.project_id,
+            {"metric": "记录数", "aggregation": "count_rows"},
+        )
+
+        distinct_by_region = {
+            item["区域"]: item["订单数"] for item in distinct["rows"]
+        }
+        self.assertEqual(distinct_by_region["华东"], 2)
+        self.assertEqual(distinct_by_region["华南"], 1)
+        self.assertEqual(rows["rows"][0]["记录数"], 4)
 
     def test_avg_without_dimension(self):
         result = execute_analysis(

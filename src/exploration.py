@@ -1,8 +1,7 @@
-import warnings
-
 import numpy as np
 import pandas as pd
 
+from src.datetime_utils import parse_datetime_series
 from src.outlier import detect_outliers_iqr
 
 
@@ -1014,40 +1013,7 @@ def generate_time_distribution_interpretation(analysis_result):
 
 def parse_exploration_datetime_series(series):
     """Parse exploration dates without imposing one format on mixed strings."""
-    source = series.copy(deep=True)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)
-        if pd.api.types.is_datetime64_any_dtype(source.dtype):
-            parsed = pd.to_datetime(
-                source,
-                errors="coerce",
-            )
-        elif pd.api.types.is_numeric_dtype(source.dtype):
-            parsed = pd.Series(
-                pd.NaT,
-                index=source.index,
-                name=source.name,
-                dtype="datetime64[ns]",
-            )
-        else:
-            try:
-                parsed = pd.to_datetime(
-                    source,
-                    errors="coerce",
-                    format="mixed",
-                )
-            except (TypeError, ValueError):
-                parsed = source.map(
-                    lambda value: pd.to_datetime(
-                        value,
-                        errors="coerce",
-                    )
-                )
-    return pd.Series(
-        parsed,
-        index=series.index,
-        name=series.name,
-    )
+    return parse_datetime_series(series)
 
 
 def _clean_time_distribution_dates(series):

@@ -37,6 +37,7 @@ from src.business_query_history_service import (
 from src.cleaner import clean_data, comparison
 from src.data_loader import basic_info, load_data
 from src.dashboard_exporter import create_excel_dashboard, detect_dashboard_fields
+from src.datetime_utils import parse_datetime_series
 from src.export_service import EXPORT_OPTIONS, export_dataframe
 import importlib
 
@@ -149,6 +150,11 @@ from src.project_workspace import (
 )
 from src.query_engine import run_query
 from src.report_generator import generate_report
+from src.report_dashboard_kpi_ui import (
+    format_dashboard_kpi_definition,
+    format_dashboard_kpi_value,
+    prepare_report_dashboard_kpi_view,
+)
 from src.services.data_source_service import (
     build_field_profile,
     delete_project_data_file,
@@ -263,6 +269,9 @@ from src.services.metric_dictionary_service import (
     list_usable_metrics,
     load_metric_dictionary,
     save_metric_dictionary,
+)
+from src.services.report_dashboard_kpi_service import (
+    build_report_dashboard_kpi_context,
 )
 from src.services.relationship_service import (
     RELATIONSHIP_TYPES,
@@ -753,6 +762,57 @@ def _safe_streamlit_key(value: str) -> str:
     if not safe_value:
         safe_value = "dataset_preview"
     return f"{safe_value}_{digest}"
+
+
+def render_report_dashboard_kpi_cards(kpi_context: dict) -> None:
+    st.markdown("#### 核心指标")
+    st.caption("以下指标统计当前报表周期的数据。")
+    st.caption(
+        "以下指标来自【指标配置 → 指标中心】中已保存、已启用且校验通过的正式指标定义。"
+    )
+    kpi_view = prepare_report_dashboard_kpi_view(kpi_context)
+
+    if not kpi_view["cards"]:
+        st.info(
+            "当前筛选范围内没有可展示的正式核心指标。"
+            "请前往【指标配置 → 指标中心 → 指标计算规则】确认并启用指标。"
+        )
+    else:
+        for card_row in kpi_view["card_rows"]:
+            card_columns = st.columns(len(card_row))
+            for card_column, item in zip(card_columns, card_row):
+                card_column.metric(
+                    str(item.get("kpi_name", "")),
+                    format_dashboard_kpi_value(item),
+                )
+                if (
+                    item.get("semantic_status") == "linked"
+                    and item.get("business_definition")
+                ):
+                    card_column.caption(
+                        format_dashboard_kpi_definition(
+                            item["business_definition"]
+                        )
+                    )
+
+        if kpi_view["is_truncated"]:
+            st.caption(
+                f"当前共有 {kpi_view['available_core_count']} 个可用核心指标，"
+                "本仪表盘展示前 6 个。"
+            )
+        if kpi_view["has_missing_semantics"]:
+            st.caption(
+                "部分指标尚未维护业务语义定义，可前往"
+                "【指标配置 → 指标中心 → 指标语义字典】补充。"
+            )
+
+    if kpi_view["failed_rows"]:
+        with st.expander("暂不可计算的指标", expanded=False):
+            st.dataframe(
+                pd.DataFrame(kpi_view["failed_rows"]),
+                hide_index=True,
+                use_container_width=True,
+            )
 
 
 def render_appended_dataset_summary(
@@ -7517,8 +7577,15 @@ with workbench_tabs[2]:
 
     with business_tabs[0]:
         st.subheader("报表仪表盘")
-        date_column = business_fields["date_column"]
-        if not date_column:
+        dashboard_date_options = get_time_distribution_datetime_columns(
+            df,
+            exploration_field_roles or {},
+        )
+        date_column = resolve_time_distribution_datetime_selection(
+            dashboard_date_options,
+            business_fields["date_column"],
+        )
+        if not dashboard_date_options or not date_column:
             st.info("未检测到时间字段，无法生成趋势报表。")
         else:
             dashboard_controls = st.columns(2)
@@ -7528,14 +7595,35 @@ with workbench_tabs[2]:
                 horizontal=True,
                 key="business_dashboard_period",
             )
+            dashboard_dataset_key = str(
+                current_analysis_dataset.get("dataset_id")
+                or current_analysis_dataset.get("file_path")
+                or current_analysis_dataset.get("dataset_name")
+                or analysis_key
+            )
+            dashboard_date_key = _safe_streamlit_key(
+                "business_dashboard_date_"
+                f"{active_project_id}_{dashboard_dataset_key}"
+            )
+            resolved_dashboard_date = (
+                resolve_time_distribution_datetime_selection(
+                    dashboard_date_options,
+                    st.session_state.get(dashboard_date_key) or date_column,
+                )
+            )
+            if (
+                st.session_state.get(dashboard_date_key)
+                != resolved_dashboard_date
+            ):
+                st.session_state[dashboard_date_key] = resolved_dashboard_date
             selected_date_column = dashboard_controls[1].selectbox(
                 "时间字段",
-                date_columns,
-                index=date_columns.index(date_column),
-                key="business_dashboard_date",
+                dashboard_date_options,
+                index=dashboard_date_options.index(resolved_dashboard_date),
+                key=dashboard_date_key,
             )
 
-            business_dates = pd.to_datetime(df[selected_date_column], errors="coerce")
+            business_dates = parse_datetime_series(df[selected_date_column])
             available_years = sorted(business_dates.dropna().dt.year.unique().astype(int).tolist())
             slice_columns = st.columns(3)
             selected_year = slice_columns[0].selectbox(
@@ -7576,19 +7664,22 @@ with workbench_tabs[2]:
                 st.info("当前时间筛选条件下没有可生成报表的数据。")
             else:
                 st.caption(f"当前报表周期：{dashboard['current_period']}")
-                kpi_cards = st.columns(4)
-                for index, metric in enumerate(["成交金额", "订单数", "客户数", "客单价"]):
-                    value = dashboard["kpi"].get(metric)
-                    display_value = "暂无数据" if value is None else f"{value:,.2f}"
-                    mom = dashboard["mom"].get(metric)
-                    kpi_cards[index].metric(
-                        f"本期{metric}",
-                        display_value,
-                        None if mom is None else f"环比 {mom:+.1f}%",
+                current_period_df = dashboard.get("current_df")
+                if (
+                    not isinstance(current_period_df, pd.DataFrame)
+                    or current_period_df.empty
+                ):
+                    st.markdown("#### 核心指标")
+                    st.caption("以下指标统计当前报表周期的数据。")
+                    st.info("当前报表周期没有可计算数据。")
+                else:
+                    dashboard_kpi_context = build_report_dashboard_kpi_context(
+                        active_project_id,
+                        current_period_df,
                     )
-                    yoy = dashboard["yoy"].get(metric)
-                    kpi_cards[index].caption("暂无同比数据" if yoy is None else f"同比 {yoy:+.1f}%")
+                    render_report_dashboard_kpi_cards(dashboard_kpi_context)
 
+                # 趋势图仍使用旧业务分析逻辑，将在后续任务迁移。
                 st.markdown("#### 经营趋势")
                 trend = dashboard["trend"]
                 trend_metrics = [metric for metric in ["成交金额", "订单数", "客户数", "客单价"] if metric in trend and trend[metric].notna().any()]

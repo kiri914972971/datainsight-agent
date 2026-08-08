@@ -3,6 +3,7 @@ import re
 
 import pandas as pd
 
+from src.datetime_utils import parse_datetime_series
 from src.eda_ai_complete import _extract_text, _request_completion
 
 
@@ -147,7 +148,7 @@ def generate_dashboard(
     comparison_df: pd.DataFrame | None = None,
 ) -> dict:
     temp = df.copy()
-    temp[date_column] = pd.to_datetime(temp[date_column], errors="coerce")
+    temp[date_column] = parse_datetime_series(temp[date_column])
     temp = temp.dropna(subset=[date_column])
     if temp.empty:
         return {"current_period": None, "kpi": calculate_kpi(temp, fields), "trend": pd.DataFrame()}
@@ -160,7 +161,7 @@ def generate_dashboard(
     previous_year_period = current_period - _periods_per_year(period)
 
     history = comparison_df.copy() if comparison_df is not None else df.copy()
-    history[date_column] = pd.to_datetime(history[date_column], errors="coerce")
+    history[date_column] = parse_datetime_series(history[date_column])
     history = history.dropna(subset=[date_column])
     history["_period"] = history[date_column].dt.to_period(frequency)
     current = history.loc[history["_period"] == current_period].drop(columns="_period")
@@ -192,7 +193,7 @@ def filter_time_slice(
     quarter: int | None = None,
     month: int | None = None,
 ) -> pd.DataFrame:
-    dates = pd.to_datetime(df[date_column], errors="coerce")
+    dates = parse_datetime_series(df[date_column])
     mask = dates.notna()
     if year is not None:
         mask &= dates.dt.year == year
